@@ -1439,7 +1439,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.0.1";
+var APP_VERSION = "1.0.2";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1521,15 +1521,40 @@ function runBatSync(lines, show){
   return { rc:rc, log:txt };
 }
 function pollDone(ctx){
+  if(ctx.finished) return;
   var fso=new ActiveXObject("Scripting.FileSystemObject");
   // stream the growing log into the pane each tick
   try{ if(fso.FileExists(ctx.log)) setLog(readText(ctx.log)); }catch(eLog){}
-  if(fso.FileExists(ctx.done)){
+
+  var done=false; try{ if(fso.FileExists(ctx.done)) done=true; }catch(eD){}
+
+  // Robust secondary signal: the engine writes the report as its FINAL action. If the
+  // report for THIS run (modified at/after start) exists and its size has stopped
+  // growing, the run finished even when the temp .done marker was missed - e.g. the
+  // console window was closed, or a Bastion/remote-session poll hiccup dropped it.
+  var stable=false;
+  if(!done && ctx.report){
+    try{
+      if(fso.FileExists(ctx.report)){
+        var f=fso.GetFile(ctx.report), mt=0;
+        try{ mt=(new Date(f.DateLastModified)).getTime(); }catch(_m){}
+        if(mt>=ctx.startMs-3000){                 // this run's report, not a stale one
+          var sz=f.Size;
+          if(sz>0 && sz===ctx.lastSize){ ctx.stableCount++; } else { ctx.stableCount=0; }
+          ctx.lastSize=sz;
+          if(ctx.stableCount>=3) stable=true;      // ~3s unchanged => write finished
+        }
+      }
+    }catch(eR){}
+  }
+
+  if(done||stable){
+    ctx.finished=true;
     var log=""; try{ if(fso.FileExists(ctx.log)) log=readText(ctx.log); }catch(e){ log="(log unreadable: "+e.message+")"; }
     try{ fso.DeleteFile(ctx.bat); }catch(e1){}
-    try{ fso.DeleteFile(ctx.done); }catch(e2){}
+    try{ if(fso.FileExists(ctx.done)) fso.DeleteFile(ctx.done); }catch(e2){}
     try{ if(fso.FileExists(ctx.log)) fso.DeleteFile(ctx.log); }catch(e3){}
-    ctx.onDone(log);
+    ctx.onDone(log, (stable&&!done)?"stable":"marker");
     return;
   }
   ctx.elapsed+=1;
@@ -1717,6 +1742,13 @@ function processRun(){
   var budget=$("rowBudget").value;
   var wf=trimStr($("winFrom").value), wt=trimStr($("winTo").value);
 
+  // the engine writes <OutDir>\<safeHost>-MFT-Report.html as its FINAL step; pollDone
+  // watches for that as a robust completion signal. safeHost must match the engine's own
+  // sanitization ([^A-Za-z0-9-_.] -> _). Delete any stale copy so we only detect this run's.
+  var safeHost = host.replace(/[^A-Za-z0-9\-_.]/g,"_");
+  var expectedReport = outDir.replace(/[\\\/]+$/,"") + "\\" + safeHost + "-MFT-Report.html";
+  try{ if(fso.FileExists(expectedReport)) fso.DeleteFile(expectedReport); }catch(eDel){}
+
   // IOC list -> temp file (avoids command-line quoting/length limits)
   var iocFile="";
   var iocs=trimStr($("iocBox").value);
@@ -1746,22 +1778,31 @@ function processRun(){
   var ctx=runBatAsync([ "powershell "+batEsc(psArgs)+" > \"__LOG__\" 2>&1" ], true);
   ctx.onTick=function(s){ setStatus("Working… "+s+"s (MFT parse is the slow part; large volumes take a few minutes)","muted"); };
   ctx.onTimeout=function(){ BUSY=false; $("runBtn").disabled=false; setStatus("Engine still running after 40 min - check the console window.","err"); };
-  ctx.onDone=function(lg){
+  ctx.onDone=function(lg, mode){
     BUSY=false; $("runBtn").disabled=false;
-    // engine prints the report path on the LAST non-empty line on success
+    // engine prints the report path on its LAST non-empty line; fall back to the
+    // expected <OutDir>\<host>-MFT-Report.html if the log was truncated (process killed).
     var rep=""; var lines=(lg+"").replace(/\r/g,"").split("\n");
-    for(var i=lines.length-1;i>=0;i--){ var ln=trimStr(lines[i]); if(ln){ rep=ln; break; } }
-    if(/ERROR:/.test(lg) || !/\.html$/i.test(rep) || !fileExists(rep)){
-      setStatus("Run failed or no report produced - see log.","err");
+    for(var i=lines.length-1;i>=0;i--){ var ln=trimStr(lines[i]); if(ln){ if(/\.html$/i.test(ln)) rep=ln; break; } }
+    if((!rep || !fileExists(rep)) && fileExists(expectedReport)) rep=expectedReport;
+    if(!rep || !fileExists(rep)){
+      setStatus(/ERROR:/.test(lg)?"Run failed - see log.":"Run finished but no report file was found - see log.","err");
       appendLog("--- last engine output ---\n"+tailLines(lg,30));
       return;
     }
+    if(mode==="stable") appendLog("(completion detected from the finished report file; the temp done-marker was not seen - harmless.)");
     LAST_REPORT=rep; $("viewBtn").disabled=false;
     if(iocFile){ try{ fso.DeleteFile(iocFile); }catch(e3){} }
     setStatus("Report ready: "+rep,"ok");
     appendLog("Report: "+rep);
     openReport(rep);
   };
+  // START the completion poll. This kickoff was missing in <=1.0.1: the run completed
+  // on disk but the UI never noticed (button stayed disabled, no auto-open). pollDone
+  // now watches BOTH the temp .done marker AND the finished report file (size-stable).
+  ctx.report=expectedReport; ctx.startMs=(new Date()).getTime();
+  ctx.stableCount=0; ctx.lastSize=-1; ctx.finished=false;
+  window.setTimeout(function(){ pollDone(ctx); }, 1000);
 }
 function tailLines(s,n){ var a=(s+"").replace(/\r/g,"").split("\n"); if(a.length<=n) return s; return a.slice(a.length-n).join("\n"); }
 
