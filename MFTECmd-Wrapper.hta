@@ -1439,8 +1439,8 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "0.3.0-p3";
-var KNOWN_LATEST_MFTECMD = "1.2.2.1";                                             // baseline as of 2026-07-03 (installed KAPE build)
+var APP_VERSION = "1.0.1";
+var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
 var EXE = "", EXE_DIR = "", LOCAL_VER = "", LATEST_VER = "", WEB_OK = false;
@@ -1468,7 +1468,7 @@ function batEsc(s){ return String(s).replace(/%/g,"%%"); }
 
 /* ---------- file IO with network-zone fallback (ADODB -> FSO), from the family ---------- */
 var FILE_IO="adodb";
-function zoneNote(){ appendLog("NOTE: running from a network location, so Windows zone policy blocks ADODB.Stream. Falling back to ANSI file IO for the small helper files (IOC list, log). The engine PS1 and report are unaffected. For full fidelity run from a LOCAL path."); }
+function zoneNote(){ appendLog("NOTE: Windows security-zone policy is blocking the UTF-8 file reader (ADODB.Stream). Usual cause is that this .hta was DOWNLOADED (it carries a Mark-of-the-Web) or sits on a network path - not the C: location itself. Falling back to ANSI file IO for the small helper files (IOC list, log); the engine and report are unaffected and processing works normally. To clear it: right-click the .hta > Properties > tick Unblock, or run  Unblock-File '<path to .hta>'  in PowerShell, then reopen."); }
 function writeText(path,text){
   if(FILE_IO==="adodb"){
     try{ var st=new ActiveXObject("ADODB.Stream"); st.Type=2; st.Charset="utf-8"; st.Open(); st.WriteText(text); st.SaveToFile(path,2); st.Close(); return; }
@@ -1595,7 +1595,7 @@ function fetchLatest(){
   LATEST_VER=KNOWN_LATEST_MFTECMD; WEB_OK=false;
   try{ var x=new ActiveXObject("MSXML2.ServerXMLHTTP.6.0"); x.setTimeouts(2000,3000,4000,4000);
     x.open("GET", MFTECMD_PAGE, false); x.send();
-    if(x.status===200){ WEB_OK=true; var t=x.responseText+""; var m=t.match(/MFTECmd[\s\S]{0,800}?(\d+\.\d+\.\d+\.\d+)/i); if(m) LATEST_VER=m[1]; }
+    if(x.status===200){ WEB_OK=true; var t=x.responseText+""; var m=t.match(/MFTECmd[\s\S]{0,800}?(\d+\.\d+\.\d+(?:\.\d+)?)/i); if(m) LATEST_VER=m[1]; }
   }catch(e){ WEB_OK=false; }
   return LATEST_VER;
 }
@@ -1613,8 +1613,10 @@ function checkVersion(){
   if(!EXE || !fileExists(EXE)){ LOCAL_VER=""; updateVerPill(); setStatus("MFTECmd.exe not found - use 'Update / download MFTECmd'","err"); return; }
   try{
     var r=runBatSync(["set DOTNET_ROLL_FORWARD=Major", '"'+batEsc(EXE)+'" --version > "__LOG__" 2>&1']);
-    var m=r.log.match(/MFTECmd version ([0-9.]+)/i);
-    if(!m) m=r.log.match(/(\d+\.\d+\.\d+\.\d+)/);
+    // current EZ builds print a bare CalVer semver "2026.5.0+<githash>"; older
+    // builds print "MFTECmd version 1.2.2.1". Match a 3- or 4-part version, stop at '+'.
+    var m=r.log.match(/MFTECmd version (\d+\.\d+\.\d+(?:\.\d+)?)/i);
+    if(!m) m=r.log.match(/(\d+\.\d+\.\d+(?:\.\d+)?)/);
     if(m){ LOCAL_VER=m[1]; updateVerPill(); setStatus("MFTECmd v"+LOCAL_VER+" detected","ok"); }
     else { LOCAL_VER=""; updateVerPill(); setStatus("Ran MFTECmd but could not parse version - see log","err"); appendLog(r.log); }
   }catch(e){ LOCAL_VER=""; updateVerPill(); setStatus("Version check failed: "+e.message,"err"); }
