@@ -1,0 +1,1855 @@
+<!doctype html>
+<html>
+<head>
+<meta http-equiv="x-ua-compatible" content="IE=edge">
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>MFTECmd Wrapper</title>
+<HTA:APPLICATION
+  ID="mftHta"
+  APPLICATIONNAME="MFTECmd Wrapper"
+  BORDER="thick"
+  CAPTION="yes"
+  SCROLL="auto"
+  SINGLEINSTANCE="yes"
+  SHOWINTASKBAR="yes"
+  MAXIMIZEBUTTON="yes"
+  MINIMIZEBUTTON="yes"
+  INNERBORDER="no"
+  CONTEXTMENU="yes"
+  SELECTION="yes" />
+<!--
+  MFTECmd Wrapper - hybrid launcher (spec Artifacts/MFTECmd-MFT/SPEC.md).
+  This .hta is a THIN LAUNCHER only: it renders a form, extracts the embedded
+  MFTECmd-Engine.ps1 next to itself at run time, invokes it, tails its log, and
+  opens the self-contained HTML report in Edge. It never loads MFT/USN row data
+  itself (that is 0.5-2M rows - far past what mshta can hold). All heavy lifting
+  is in the PS1; all rendering is in the emitted report, viewed in Chromium.
+
+  MFTECmd contract (verified 2026-07-03 against v1.2.2.1):
+    - $MFT:  MFTECmd.exe -f "<$MFT>" --csv "<out>" --csvf mft.csv
+    - $J:    MFTECmd.exe -f "<$J>" -m "<$MFT>" --csv "<out>" --csvf j.csv   (-m resolves ParentPath)
+    - Needs a real console (Console.WindowWidth) -> always run via a cmd window.
+    - On a cmd command line the %3A in Velociraptor paths must stay SINGLE; the
+      %-doubling batEsc() is for the .bat FILE lines the engine is NOT written into.
+      Here we pass paths as PS -File arguments, so batEsc applies only to the bat
+      wrapper line, and the engine receives clean single-% paths. (verified)
+  Payload trap: the embedded PS1 is stored in a <script type="text/plain"> block.
+  The engine is written so NO literal close-script sequence appears in it (it builds
+  that tag by concatenation), so the block cannot be terminated early. A startup
+  self-check confirms the payload ends with '# MFTECMD-ENGINE-END'.
+-->
+<style>
+  html{margin:0;height:100%;background:#0d1117}
+  body{margin:0;height:100%;background:#0d1117;color:#e6edf3;font-family:Segoe UI,Tahoma,sans-serif;font-size:16px;zoom:0.9}
+  a{color:#58a6ff}
+  .mono{font-family:Consolas,"Courier New",monospace}
+  .muted{color:#8b949e}
+  .err{color:#f85149}
+  .ok{color:#3fb950}
+  header{padding:8px 14px;background:#161b22;border-bottom:1px solid #30363d}
+  header h1{display:inline-block;font-size:15px;margin:0;font-weight:600;vertical-align:middle}
+  header h1 small{color:#8b949e;font-weight:400}
+  .pill{display:inline-block;font-size:11px;color:#8b949e;border:1px solid #30363d;border-radius:20px;padding:2px 10px;margin-left:8px;vertical-align:middle}
+  .wrap{padding:12px 14px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:12px}
+  .card h3{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e}
+  label.fld{display:block;margin:8px 0 2px;font-size:11px;color:#8b949e}
+  input.txt,select,textarea{background:#1c2330;border:1px solid #30363d;color:#e6edf3;border-radius:6px;padding:5px 8px;font-size:13px;font-family:Consolas,monospace}
+  input.wide{width:70%}
+  input.mid{width:38%}
+  textarea.ioc{width:70%;height:64px;white-space:pre;overflow:auto}
+  .btn{background:#1c2330;border:1px solid #30363d;color:#e6edf3;border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer;margin:2px}
+  .btn:hover{border-color:#58a6ff}
+  .btn.primary{background:#1f6feb;border-color:#1f6feb}
+  .btn:disabled{opacity:.5;cursor:default;border-color:#30363d}
+  .row{white-space:nowrap;margin:2px 0}
+  .hint{font-size:11px;color:#8b949e;margin-top:3px}
+  .sep{display:inline-block;width:1px;height:18px;background:#30363d;margin:0 6px;vertical-align:middle}
+  #status{margin:6px 0;font-size:12px}
+  #exeline{font-size:11px;color:#8b949e;margin-top:6px}
+  #log{white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;color:#8b949e;max-height:280px;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;display:none;margin-top:8px}
+  .hide{display:none}
+  .grid2{display:inline-block;width:49%;vertical-align:top}
+</style>
+</head>
+<body>
+<header>
+  <h1>MFTECmd Wrapper <small>&mdash; $MFT / $J filesystem triage <span id="appver"></span></small></h1>
+  <span class="pill" id="verpill">version: checking&hellip;</span>
+  <span class="pill" id="modepill">launcher</span>
+  <span style="float:right">
+    <button class="btn" id="fdown" title="Smaller text">A&minus;</button>
+    <button class="btn" id="fup" title="Larger text">A+</button>
+  </span>
+</header>
+
+<div class="wrap">
+
+  <div class="card">
+    <h3>Input artifacts</h3>
+    <div class="row">
+      <label class="fld">$MFT file (required)</label>
+      <input class="txt wide mono" id="mftPath" placeholder="path to a collected $MFT (e.g. ...\uploads\ntfs\%5C%5C.%5CC%3A\$MFT)">
+      <button class="btn" id="mftBrowse">Browse file&hellip;</button>
+      <button class="btn" id="mftDirBrowse">Browse collection&hellip;</button>
+    </div>
+    <div class="row">
+      <label class="fld">$J USN journal (optional, strongly recommended)</label>
+      <input class="txt wide mono" id="jPath" placeholder="path to $Extend\$UsnJrnl%3A$J - auto-filled when found next to $MFT">
+      <button class="btn" id="jBrowse">Browse file&hellip;</button>
+      <button class="btn" id="jClear">Clear</button>
+    </div>
+    <div id="exeline"></div>
+  </div>
+
+  <div class="card">
+    <h3>Options</h3>
+    <div class="row">
+      <span class="grid2">
+        <label class="fld">Host label (report name + header)</label>
+        <input class="txt mono" style="width:80%" id="hostLabel" placeholder="auto-detected from collection folder">
+      </span>
+      <span class="grid2">
+        <label class="fld">Embedded row budget (per set)</label>
+        <select id="rowBudget">
+          <option value="50000">50,000</option>
+          <option value="100000" selected>100,000 (default)</option>
+          <option value="200000">200,000</option>
+        </select>
+      </span>
+    </div>
+    <div class="row">
+      <span class="grid2">
+        <label class="fld">Window from (UTC, YYYY-MM-DD, optional)</label>
+        <input class="txt mono" style="width:60%" id="winFrom" placeholder="2026-06-01">
+      </span>
+      <span class="grid2">
+        <label class="fld">Window to (UTC, YYYY-MM-DD, optional)</label>
+        <input class="txt mono" style="width:60%" id="winTo" placeholder="2026-06-30">
+      </span>
+    </div>
+    <div class="hint">The window is not a hard filter - it prioritises in-window rows during reduction and drives the ACTIVE-window heuristics.</div>
+    <div class="row">
+      <label class="fld">IOC terms (optional, comma or newline separated) - baked in at parse time so hits always survive reduction</label>
+      <textarea class="ioc mono" id="iocBox" placeholder="one term per line, e.g.&#10;\AppData\Local\Temp\&#10;payload.exe&#10;suspicious.dll&#10;&hellip;"></textarea>
+      <button class="btn" id="iocLoad">Load from file&hellip;</button>
+    </div>
+    <div class="row">
+      <label class="fld">Output folder (report + full CSVs land here)</label>
+      <input class="txt wide mono" id="outDir">
+      <button class="btn" id="outBrowse">Browse&hellip;</button>
+      <button class="btn" id="outOpen">Open</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button class="btn primary" id="runBtn">Process &rarr; build report</button>
+      <button class="btn" id="viewBtn" disabled>View last report</button>
+      <span class="sep"></span>
+      <button class="btn" id="verBtn">Check MFTECmd version</button>
+      <button class="btn" id="updBtn">Update / download MFTECmd</button>
+      <span class="sep"></span>
+      <button class="btn" id="logToggle">Show log</button>
+    </div>
+    <div id="status" class="muted">Ready.</div>
+    <div id="log" data-ph="1"></div>
+  </div>
+
+</div>
+
+<!-- ============================ EMBEDDED PS1 PAYLOAD ============================
+     The full MFTECmd-Engine.ps1 is injected verbatim between the markers below by
+     the build/splice step. It is inert here (type="text/plain"); the launcher reads
+     it back with getElementById("ps1Payload").text and writes it to disk at run time.
+     Do NOT hand-edit inside the markers - edit MFTECmd-Engine.ps1 and re-splice. -->
+<script type="text/plain" id="ps1Payload">
+# MFTECmd-Engine.ps1 - parse/score/reduce/report engine for MFTECmd-Wrapper.
+# Phase 1: standalone script (later embedded in MFTECmd-Wrapper.hta).
+# Target: Windows PowerShell 5.1. ASCII only. All timestamps UTC, never localized.
+# Contract: exit 0 and print report path on the LAST line; nonzero + message on error.
+# MFTECMD-ENGINE-START
+param(
+    [Parameter(Mandatory=$true)][string]$Mft,
+    [string]$J = "",
+    [Parameter(Mandatory=$true)][string]$OutDir,
+    [string]$HostLabel = "",
+    [string]$IocFile = "",
+    [int]$RowBudget = 100000,
+    [string]$From = "",
+    [string]$To = "",
+    [string]$AppVersion = "0.1.0-dev",
+    [string]$MftecmdPath = ""
+)
+
+$ErrorActionPreference = "Stop"
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Say([string]$m) {
+    Write-Output ("[{0}] {1}" -f $sw.Elapsed.ToString("mm\:ss"), $m)
+}
+function Fail([string]$m) {
+    Write-Output ("ERROR: " + $m)
+    exit 1
+}
+
+# ---------------------------------------------------------------- constants
+# NB: PS variable names are case-insensitive - constants here must never share a
+# name with per-row locals (a '$risky = ...' assignment would clobber '$RISKY').
+$RISKYEXT = @{}
+foreach ($e in @("exe","dll","sys","ps1","psm1","bat","cmd","vbs","vbe","js","jse",
+                 "wsf","hta","jar","msi","scr","cpl","lnk","iso","img","vhd","vhdx",
+                 "7z","zip","rar")) { $RISKYEXT[$e] = $true }
+
+# user-writable path fragments (lowercase, matched against lowercase full path)
+$USERPATHS = @("\users\","\appdata\","\temp\","\downloads\","\programdata\",
+               "\perflogs\","\windows\temp\","\`$recycle.bin\","\public\",
+               "\config\systemprofile\")
+# paths that LOOK user-writable by fragment but are not (servicing noise)
+$NOTUSERPATHS = @("\winsxs\","\windows\servicing\","\windows\softwaredistribution\")
+
+$LOLBINS = @{}
+foreach ($e in @("powershell","powershell_ise","pwsh","cmd","wscript","cscript",
+                 "mshta","rundll32","regsvr32","certutil","certreq","bitsadmin",
+                 "msiexec","curl","wget","node","java","javaw","python","pythonw",
+                 "php","autoit3","nc","ncat","psexec","psexesvc","wmic","schtasks",
+                 "reg","sc")) { $LOLBINS[$e] = $true }
+
+$OSNAMES = @{}
+foreach ($e in @("svchost","lsass","csrss","services","winlogon","explorer",
+                 "taskhostw","dllhost","conhost","smss","wininit")) { $OSNAMES[$e] = $true }
+
+# deceptive naming: doc-looking name with executable payload extension, or a
+# DIRECTORY named like a document (a loader pattern seen in the wild: a folder
+# named e.g. report.docx that actually holds an executable payload)
+$reDblExt = [regex]::new('\.(doc|docx|pdf|xls|xlsx|ppt|pptx|txt|rtf|csv|jpg|jpeg|png)\.(exe|scr|com|bat|cmd|js|jse|vbs|vbe|hta|ps1|lnk)$',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Compiled)
+$reDocDir = [regex]::new('\.(doc|docx|pdf|xls|xlsx|ppt|pptx)$',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Compiled)
+# JSON escape trigger: anything outside plain printable ASCII, or " \ <
+$reJsonEsc = [regex]::new('[^\x20-\x7E]|["\\<]',
+    [System.Text.RegularExpressions.RegexOptions]::Compiled)
+
+$RECENT_DAYS = 14
+$CRTDEL_HOURS = 48
+$BURST_N = 50
+$BURST_SECS = 600
+
+# ---------------------------------------------------------------- helpers
+function LooksRandom([string]$base) {
+    # conservative on purpose: 'comctl32' / 'mfmpeg2srcsnk' style system names must
+    # not fire; hex/base32-looking payload names should
+    if ($base.Length -lt 10) { return $false }
+    $v = 0; $d = 0
+    for ($i = 0; $i -lt $base.Length; $i++) {
+        $c = $base[$i]
+        if ("aeiouy".IndexOf($c) -ge 0) { $v++ }
+        elseif ($c -ge '0' -and $c -le '9') { $d++ }
+        elseif (-not ($c -ge 'a' -and $c -le 'z')) { return $false } # only [a-z0-9] qualifies
+    }
+    $vr = $v / $base.Length
+    if ($vr -lt 0.1 -and ($d -ge 2 -or $base.Length -ge 16)) { return $true }
+    return $false
+}
+
+# split one physical CSV line; caller guarantees quotes are balanced
+function SplitCsvLine([string]$line) {
+    if ($line.IndexOf('"') -lt 0) { return $line.Split(',') }
+    $out = New-Object System.Collections.Generic.List[string]
+    $sb = New-Object System.Text.StringBuilder
+    $inQ = $false
+    for ($i = 0; $i -lt $line.Length; $i++) {
+        $c = $line[$i]
+        if ($inQ) {
+            if ($c -eq '"') {
+                if ($i + 1 -lt $line.Length -and $line[$i+1] -eq '"') { [void]$sb.Append('"'); $i++ }
+                else { $inQ = $false }
+            } else { [void]$sb.Append($c) }
+        } else {
+            if ($c -eq '"') { $inQ = $true }
+            elseif ($c -eq ',') { $out.Add($sb.ToString()); [void]$sb.Clear() }
+            else { [void]$sb.Append($c) }
+        }
+    }
+    $out.Add($sb.ToString())
+    return $out.ToArray()
+}
+
+# read one logical CSV record (merges physical lines while quotes are unbalanced)
+function ReadCsvRecord([System.IO.StreamReader]$sr) {
+    $line = $sr.ReadLine()
+    if ($null -eq $line) { return $null }
+    if ($line.IndexOf('"') -ge 0) {
+        $qc = $line.Length - $line.Replace('"','').Length
+        while (($qc % 2) -eq 1) {
+            $nxt = $sr.ReadLine()
+            if ($null -eq $nxt) { break }
+            $line = $line + "`n" + $nxt
+            $qc += $nxt.Length - $nxt.Replace('"','').Length
+        }
+    }
+    return $line
+}
+
+function JsonStr([string]$s, [System.Text.StringBuilder]$sb) {
+    [void]$sb.Append('"')
+    if ($null -ne $s -and $s.Length -gt 0) {
+        if (-not $reJsonEsc.IsMatch($s)) {
+            [void]$sb.Append($s)
+        } else {
+            for ($i = 0; $i -lt $s.Length; $i++) {
+                $c = $s[$i]
+                switch ($c) {
+                    '"'  { [void]$sb.Append('\"') }
+                    '\'  { [void]$sb.Append('\\') }
+                    '<'  { [void]$sb.Append('\u').Append('003C') }  # so data can never form a close-script tag
+                    "`n" { [void]$sb.Append('\n') }
+                    "`r" { [void]$sb.Append('\r') }
+                    "`t" { [void]$sb.Append('\t') }
+                    default {
+                        $n = [int]$c
+                        if ($n -lt 32 -or $n -gt 126) { [void]$sb.Append('\u').Append($n.ToString('X4')) }
+                        else { [void]$sb.Append($c) }
+                    }
+                }
+            }
+        }
+    }
+    [void]$sb.Append('"')
+}
+
+function ColIx([hashtable]$map, [string]$name) {
+    if (-not $map.ContainsKey($name)) { Fail ("CSV is missing expected column '" + $name + "' - MFTECmd version mismatch?") }
+    return [int]$map[$name]
+}
+
+# ---------------------------------------------------------------- stage 0: inputs
+if (-not (Test-Path -LiteralPath $Mft)) { Fail ("`$MFT not found: " + $Mft) }
+$haveJ = ($J -ne "" -and (Test-Path -LiteralPath $J))
+if ($J -ne "" -and -not $haveJ) { Say ("WARN: `$J path not found, continuing MFT-only: " + $J) }
+if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
+$csvDir = Join-Path $OutDir "csv"
+if (-not (Test-Path -LiteralPath $csvDir)) { New-Item -ItemType Directory -Force -Path $csvDir | Out-Null }
+
+if ($HostLabel -eq "") {
+    if ($Mft -match 'Collection-([A-Za-z0-9\-_]+?)-\d{4}-\d{2}-\d{2}') { $HostLabel = $Matches[1] }
+    else { $HostLabel = "HOST" }
+}
+$safeHost = ($HostLabel -replace '[^A-Za-z0-9\-_\.]', '_')
+
+# IOC list: comma/newline separated, lowercased, '#' comments ignored
+$IOCS = @()
+if ($IocFile -ne "" -and (Test-Path -LiteralPath $IocFile)) {
+    $raw = [System.IO.File]::ReadAllText($IocFile)
+    $IOCS = @($raw -split '[,\r\n]+' | ForEach-Object { $_.Trim().ToLowerInvariant() } |
+              Where-Object { $_ -ne "" -and -not $_.StartsWith("#") } | Select-Object -Unique)
+}
+$nIoc = $IOCS.Count
+
+# normalize window bounds to sortable 'yyyy-MM-dd HH:mm:ss' strings
+$winFrom = ""; $winTo = ""
+if ($From -ne "") { $winFrom = ($From.Trim() + " 00:00:00").Substring(0,19) }
+if ($To -ne "")   { $winTo   = ($To.Trim()   + " 23:59:59").Substring(0,19) }
+$haveWin = ($winFrom -ne "" -or $winTo -ne "")
+
+Say ("Engine v" + $AppVersion + "  host=" + $HostLabel + "  iocs=" + $nIoc + "  budget=" + $RowBudget + "/set")
+
+# ---------------------------------------------------------------- stage 1: run MFTECmd
+if ($MftecmdPath -eq "") {
+    $cand = @(
+        (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "MFTECmd.exe"),
+        "C:\Users\Forensics\Downloads\1-Package\KAPE\Modules\bin\MFTECmd.exe",
+        "C:\Tools\net9\MFTECmd.exe"
+    )
+    foreach ($c in $cand) { if (Test-Path -LiteralPath $c) { $MftecmdPath = $c; break } }
+}
+if ($MftecmdPath -eq "" -or -not (Test-Path -LiteralPath $MftecmdPath)) { Fail "MFTECmd.exe not found (searched script dir, KAPE bin, C:\Tools\net9)" }
+$toolVer = (Get-Item -LiteralPath $MftecmdPath).VersionInfo.FileVersion
+
+$mftCsv = Join-Path $csvDir "mft.csv"
+$jCsv   = Join-Path $csvDir "j.csv"
+$env:DOTNET_ROLL_FORWARD = "Major"
+
+function RunTool([string]$args_, [string]$logName) {
+    $log = Join-Path $csvDir $logName
+    # NB: cmd /c command line - do NOT double % here (that is batch-FILE escaping).
+    # MFTECmd probes the console; the HTA launcher always provides one.
+    cmd /c ("`"" + $MftecmdPath + "`" " + $args_ + " > `"" + $log + "`" 2>&1")
+    return $LASTEXITCODE
+}
+
+if ((Test-Path -LiteralPath $mftCsv) -and ((Get-Item -LiteralPath $mftCsv).Length -gt 0)) {
+    Say ("[1/6] Reusing existing " + $mftCsv)
+} else {
+    Say "[1/6] Running MFTECmd on `$MFT ..."
+    $rc = RunTool ("-f `"" + $Mft + "`" --csv `"" + $csvDir + "`" --csvf mft.csv") "mftecmd_mft.log"
+    if ($rc -ne 0 -or -not (Test-Path -LiteralPath $mftCsv)) { Fail ("MFTECmd `$MFT parse failed (rc=" + $rc + ") - see " + (Join-Path $csvDir "mftecmd_mft.log")) }
+}
+if ($haveJ) {
+    if ((Test-Path -LiteralPath $jCsv) -and ((Get-Item -LiteralPath $jCsv).Length -gt 0)) {
+        Say ("[1/6] Reusing existing " + $jCsv)
+    } else {
+        Say "[1/6] Running MFTECmd on `$J ..."
+        $rc = RunTool ("-f `"" + $J + "`" -m `"" + $Mft + "`" --csv `"" + $csvDir + "`" --csvf j.csv") "mftecmd_j.log"
+        if ($rc -ne 0 -or -not (Test-Path -LiteralPath $jCsv)) { Fail ("MFTECmd `$J parse failed (rc=" + $rc + ") - see " + (Join-Path $csvDir "mftecmd_j.log")) }
+    }
+}
+
+# ---------------------------------------------------------------- stage 2: parse + score $MFT
+# kept-row layout (indexes matter - viewer cols map below must match):
+#  0 entry 1 seq 2 deleted 3 parentPath 4 fileName 5 ext 6 size 7 isDir 8 hasAds
+#  9 zoneId 10 cr10 11 cr30 12 mod10 13 acc10 14 score 15 tags 16 why
+Say "[2/6] Parsing + scoring `$MFT csv ..."
+
+$t1m = New-Object 'System.Collections.Generic.List[object[]]'   # IOC hits
+$t2m = New-Object 'System.Collections.Generic.List[object[]]'   # score >= 4
+$t3m = New-Object 'System.Collections.Generic.List[object[]]'   # score >= 2
+$t4m = New-Object 'System.Collections.Generic.List[object[]]'   # score >= 1
+$t5m = New-Object 'System.Collections.Generic.List[object[]]'   # in-window risky ext
+$t6m = New-Object 'System.Collections.Generic.List[object[]]'   # remainder (bounded, newest kept)
+$t6mMin = ""      # newest-N threshold: skip rows older than this once bounded
+$mftTotal = 0; $mftDel = 0; $mftAds = 0; $mftStomp = 0; $mftIoc = 0
+$maxTsM = ""
+
+$srm = New-Object System.IO.StreamReader($mftCsv, [System.Text.Encoding]::UTF8, $true, 1MB)
+try {
+    $hdr = $srm.ReadLine()
+    if ($hdr.Length -gt 0 -and [int]$hdr[0] -eq 0xFEFF) { $hdr = $hdr.Substring(1) }
+    $map = @{}; $hc = $hdr.Split(','); for ($i = 0; $i -lt $hc.Length; $i++) { $map[$hc[$i]] = $i }
+    $cEntry = ColIx $map "EntryNumber";  $cSeq = ColIx $map "SequenceNumber"
+    $cInUse = ColIx $map "InUse";        $cPP  = ColIx $map "ParentPath"
+    $cFN    = ColIx $map "FileName";     $cExt = ColIx $map "Extension"
+    $cSize  = ColIx $map "FileSize";     $cDir = ColIx $map "IsDirectory"
+    $cAds   = ColIx $map "HasAds";       $cIsAds = ColIx $map "IsAds"
+    $cSiFn  = ColIx $map "SI<FN";        $cZone  = ColIx $map "ZoneIdContents"
+    $cCr10  = ColIx $map "Created0x10";  $cCr30  = ColIx $map "Created0x30"
+    $cMod10 = ColIx $map "LastModified0x10"; $cAcc10 = ColIx $map "LastAccess0x10"
+    $nCols = $hc.Length
+
+    while ($true) {
+        $line = ReadCsvRecord $srm
+        if ($null -eq $line) { break }
+        if ($line.Length -eq 0) { continue }
+        $f = SplitCsvLine $line
+        if ($f.Length -lt $nCols) { continue }   # malformed tail row
+        $mftTotal++
+
+        $fn  = $f[$cFN];  $pp = $f[$cPP]
+        $ext = $f[$cExt]; if ($ext.Length -gt 0 -and $ext[0] -eq '.') { $ext = $ext.Substring(1) }
+        $extL = $ext.ToLowerInvariant()
+        $isDir = ($f[$cDir] -eq "True")
+        $deleted = ($f[$cInUse] -ne "True")
+        $hasAds = ($f[$cAds] -eq "True")
+        $zone = $f[$cZone]
+        $cr10 = $f[$cCr10]; $cr30 = $f[$cCr30]; $mod10 = $f[$cMod10]
+        if ($deleted) { $mftDel++ }
+        if ($hasAds) { $mftAds++ }
+        if ($cr10.CompareTo($maxTsM) -gt 0) { $maxTsM = $cr10 }
+
+        $risky = ($extL.Length -gt 0 -and $RISKYEXT.ContainsKey($extL))
+        $score = 0; $tags = ""; $why = ""
+        $fpL = $null
+        if ($nIoc -gt 0 -or $risky -or $extL -eq "exe" -or ($isDir -and $fn.IndexOf('.') -ge 0)) {
+            $fpL = ($pp + "\" + $fn).ToLowerInvariant()
+        }
+
+        $inUser = $false
+        if ($null -ne $fpL) {
+            foreach ($u in $USERPATHS) { if ($fpL.IndexOf($u) -ge 0) { $inUser = $true; break } }
+            if ($inUser) {
+                foreach ($u in $NOTUSERPATHS) { if ($fpL.IndexOf($u) -ge 0) { $inUser = $false; break } }
+            }
+        }
+
+        # H1 USERPATH
+        if ($risky -and $inUser) { $score += 2; $tags += "|USERPATH"; $why += "; risky ext in user-writable path" }
+        # H2 TIMESTOMP (MFTECmd SI<FN flag; ignore sub-second-only deltas; files only)
+        if (-not $isDir -and $f[$cSiFn] -eq "True" -and $cr30.Length -ge 19 -and $cr10.Length -ge 19 -and
+            $cr30.Substring(0,19) -ne $cr10.Substring(0,19)) {
+            $mftStomp++
+            # +3 only for executable content in user paths; installers and cloud-sync
+            # clients (Dropbox/OneDrive preserve old SI times) make this noisy otherwise.
+            # Downloaded files (Zone.Identifier present) are the #1 benign SI<FN source -
+            # download+extract keeps original timestamps - so demote them to +1 even when
+            # risky+userpath, which is exactly a downloaded installer .dll/.exe. (Verified:
+            # 2017 Dell / 2021 SciWord installer packages were out-ranking the RAT otherwise.)
+            if ($inUser -and $risky -and $zone.Length -eq 0) { $score += 3 } else { $score += 1 }
+            $tags += "|TIMESTOMP"; $why += "; SI created (" + $cr10.Substring(0,19) + ") earlier than FN created (" + $cr30.Substring(0,19) + ")"
+        }
+        # H3 ADS
+        if ($hasAds -and -not $isDir) {
+            $score += 1; $tags += "|ADS"
+            if ($zone.Length -gt 0) { $score += 1; $why += "; downloaded (Zone.Identifier present)" } else { $why += "; has alternate data stream" }
+        }
+        # H5 MASQ
+        if ($extL -eq "exe") {
+            $base = $fn.Substring(0, $fn.Length - 4).ToLowerInvariant()
+            if ($OSNAMES.ContainsKey($base) -and $fpL.IndexOf("\windows\") -lt 0) {
+                $score += 3; $tags += "|MASQ"; $why += "; OS binary name outside \Windows"
+            }
+        }
+        # H6 RANDOM
+        if ($risky) {
+            $dot = $fn.LastIndexOf('.')
+            $base = if ($dot -gt 0) { $fn.Substring(0, $dot).ToLowerInvariant() } else { $fn.ToLowerInvariant() }
+            if (LooksRandom $base) { $score += 1; $tags += "|RANDOM"; $why += "; random-looking name" }
+        }
+        # H7 DBLEXT (file: doc.pdf.exe / dir named like a document)
+        if ($risky -and $reDblExt.IsMatch($fn)) {
+            $score += 2; $tags += "|DBLEXT"; $why += "; double extension"
+        } elseif ($isDir -and $fn.IndexOf('.') -ge 0 -and $reDocDir.IsMatch($fn)) {
+            $score += 2; $tags += "|DBLEXT"; $why += "; DIRECTORY named like a document"
+        }
+        # H9 DELEXE
+        if ($deleted -and $risky) { $score += 1; $tags += "|DELETED"; $why += "; deleted" }
+        # H10 IOC
+        $iocHit = $false
+        if ($nIoc -gt 0) {
+            $hits = ""
+            foreach ($t in $IOCS) {
+                if ($fpL.IndexOf($t) -ge 0 -or ($zone.Length -gt 0 -and $zone.ToLowerInvariant().IndexOf($t) -ge 0)) {
+                    if ($hits -ne "") { $hits += ", " }
+                    $hits += $t
+                    if ($hits.Length -gt 120) { break }
+                }
+            }
+            # IOC = analyst-supplied known-bad. Weight it so a hit outranks any stack of
+            # generic heuristics (a benign old installer can reach USERPATH+TIMESTOMP+ADS=6;
+            # a real indicator match must sit above that). +5 puts USERPATH+IOC at 7.
+            if ($hits -ne "") { $iocHit = $true; $mftIoc++; $score += 5; $tags += "|IOC"; $why += "; IOC hit: " + $hits }
+        }
+
+        # size/entry as numbers for compact JSON
+        $sizeN = [long]0; [void][long]::TryParse($f[$cSize], [ref]$sizeN)
+        $entN = 0; [void][int]::TryParse($f[$cEntry], [ref]$entN)
+        $seqN = 0; [void][int]::TryParse($f[$cSeq], [ref]$seqN)
+        $row = @($entN, $seqN, $(if ($deleted) {1} else {0}), $pp, $fn, $extL, $sizeN,
+                 $(if ($isDir) {1} else {0}), $(if ($hasAds) {1} else {0}), $zone,
+                 $(if ($cr10.Length -ge 19) { $cr10.Substring(0,19) } else { $cr10 }),
+                 $(if ($cr30.Length -ge 19) { $cr30.Substring(0,19) } else { $cr30 }),
+                 $(if ($mod10.Length -ge 19) { $mod10.Substring(0,19) } else { $mod10 }),
+                 $(if ($f[$cAcc10].Length -ge 19) { $f[$cAcc10].Substring(0,19) } else { $f[$cAcc10] }),
+                 $score, $tags.TrimStart('|'), $why.TrimStart('; '))
+
+        if ($iocHit) { $t1m.Add($row) }
+        elseif ($score -ge 4) { $t2m.Add($row) }
+        elseif ($score -ge 2) { $t3m.Add($row) }
+        elseif ($score -ge 1) { $t4m.Add($row) }
+        else {
+            $ts = [string]$row[10]
+            $inWin = $false
+            if ($haveWin) {
+                $inWin = $true
+                if ($winFrom -ne "" -and $ts.CompareTo($winFrom) -lt 0) { $inWin = $false }
+                if ($winTo -ne "" -and $ts.CompareTo($winTo) -gt 0) { $inWin = $false }
+            }
+            if ($inWin -and $risky) { $t5m.Add($row) }
+            else {
+                # bounded newest-N remainder
+                if ($t6mMin -eq "" -or $ts.CompareTo($t6mMin) -ge 0) {
+                    $t6m.Add($row)
+                    if ($t6m.Count -ge ($RowBudget * 2)) {
+                        $keys = New-Object 'string[]' $t6m.Count
+                        $items = $t6m.ToArray()
+                        for ($k = 0; $k -lt $items.Length; $k++) { $keys[$k] = [string]$items[$k][10] }
+                        [System.Array]::Sort($keys, $items)          # ascending; newest at end
+                        $t6m.Clear()
+                        for ($k = $items.Length - $RowBudget; $k -lt $items.Length; $k++) { $t6m.Add($items[$k]) }
+                        $t6mMin = [string]$t6m[0][10]
+                    }
+                }
+            }
+        }
+        if (($mftTotal % 200000) -eq 0) { Say ("      ... " + $mftTotal.ToString("N0") + " MFT rows") }
+    }
+} finally { $srm.Close() }
+Say ("      `$MFT: " + $mftTotal.ToString("N0") + " rows parsed (" + $mftDel.ToString("N0") + " deleted, " +
+     $mftStomp.ToString("N0") + " SI<FN, " + $mftIoc.ToString("N0") + " IOC hits)")
+
+# ---------------------------------------------------------------- stage 3: parse + score $J
+#  kept-row layout: 0 ts 1 name 2 ext 3 entry 4 seq 5 parentPath 6 updReasons
+#                   7 attrs 8 score 9 tags 10 why
+$jRows = New-Object 'System.Collections.Generic.List[object[]]'
+$jTotal = 0; $jIoc = 0
+$maxTsJ = ""
+$hist = @{}                     # day -> event count (FULL set, pre-reduction)
+$creTs = @{}; $delTs = @{}      # entry-seq -> first FileCreate ts / last FileDelete ts
+$burst = @{}                    # parentPathLower -> List of row refs with FileCreate
+
+if ($haveJ) {
+    Say "[3/6] Parsing + scoring `$J csv ..."
+    $srj = New-Object System.IO.StreamReader($jCsv, [System.Text.Encoding]::UTF8, $true, 1MB)
+    try {
+        $hdr = $srj.ReadLine()
+        if ($hdr.Length -gt 0 -and [int]$hdr[0] -eq 0xFEFF) { $hdr = $hdr.Substring(1) }
+        $map = @{}; $hc = $hdr.Split(','); for ($i = 0; $i -lt $hc.Length; $i++) { $map[$hc[$i]] = $i }
+        $cName = ColIx $map "Name";       $cExt = ColIx $map "Extension"
+        $cEntry = ColIx $map "EntryNumber"; $cSeq = ColIx $map "SequenceNumber"
+        $cPP = ColIx $map "ParentPath";   $cTs = ColIx $map "UpdateTimestamp"
+        $cUpd = ColIx $map "UpdateReasons"; $cAttr = ColIx $map "FileAttributes"
+        $nCols = $hc.Length
+
+        while ($true) {
+            $line = ReadCsvRecord $srj
+            if ($null -eq $line) { break }
+            if ($line.Length -eq 0) { continue }
+            $f = SplitCsvLine $line
+            if ($f.Length -lt $nCols) { continue }
+            $jTotal++
+
+            $ts = $f[$cTs]; if ($ts.Length -gt 19) { $ts = $ts.Substring(0,19) }
+            $fn = $f[$cName]; $pp = $f[$cPP]; $upd = $f[$cUpd]
+            $ext = $f[$cExt]; if ($ext.Length -gt 0 -and $ext[0] -eq '.') { $ext = $ext.Substring(1) }
+            $extL = $ext.ToLowerInvariant()
+            if ($ts.CompareTo($maxTsJ) -gt 0) { $maxTsJ = $ts }
+            $day = if ($ts.Length -ge 10) { $ts.Substring(0,10) } else { "?" }
+            if ($hist.ContainsKey($day)) { $hist[$day] = $hist[$day] + 1 } else { $hist[$day] = 1 }
+
+            $risky = ($extL.Length -gt 0 -and $RISKYEXT.ContainsKey($extL))
+            $isCreate = $upd.IndexOf("FileCreate") -ge 0
+            $isDelete = $upd.IndexOf("FileDelete") -ge 0
+            $isWrite = $isCreate -or $upd.IndexOf("DataExtend") -ge 0 -or $upd.IndexOf("DataOverwrite") -ge 0 -or $upd.IndexOf("RenameNewName") -ge 0
+            $key = $f[$cEntry] + "-" + $f[$cSeq]
+            if ($isCreate) {
+                if (-not $creTs.ContainsKey($key) -or $ts.CompareTo($creTs[$key]) -lt 0) { $creTs[$key] = $ts }
+            }
+            if ($isDelete) {
+                if (-not $delTs.ContainsKey($key) -or $ts.CompareTo($delTs[$key]) -gt 0) { $delTs[$key] = $ts }
+            }
+
+            $score = 0; $tags = ""; $why = ""
+            # $J is small enough to lowercase every row; post-passes need $inUser for all
+            $fpL = ($pp + "\" + $fn).ToLowerInvariant()
+            $inUser = $false
+            foreach ($u in $USERPATHS) { if ($fpL.IndexOf($u) -ge 0) { $inUser = $true; break } }
+            if ($inUser) {
+                foreach ($u in $NOTUSERPATHS) { if ($fpL.IndexOf($u) -ge 0) { $inUser = $false; break } }
+            }
+
+            # H1 USERPATH (write/create of risky ext in user-writable path)
+            if ($risky -and $inUser -and $isWrite) { $score += 2; $tags += "|USERPATH"; $why += "; risky ext written in user-writable path" }
+            # H5 MASQ
+            if ($extL -eq "exe") {
+                $base = $fn.Substring(0, $fn.Length - 4).ToLowerInvariant()
+                if ($OSNAMES.ContainsKey($base) -and $fpL.IndexOf("\windows\") -lt 0) {
+                    $score += 3; $tags += "|MASQ"; $why += "; OS binary name outside \Windows"
+                }
+                # H11 LOLBIN (writes only)
+                if ($LOLBINS.ContainsKey($base) -and $inUser -and $isWrite) {
+                    $score += 1; $tags += "|LOLBIN"; $why += "; LOLBin written to user-writable path"
+                }
+            }
+            # H6 RANDOM
+            if ($risky) {
+                $dot = $fn.LastIndexOf('.')
+                $base = if ($dot -gt 0) { $fn.Substring(0, $dot).ToLowerInvariant() } else { $fn.ToLowerInvariant() }
+                if (LooksRandom $base) { $score += 1; $tags += "|RANDOM"; $why += "; random-looking name" }
+            }
+            # H7 DBLEXT
+            if ($risky -and $reDblExt.IsMatch($fn)) { $score += 2; $tags += "|DBLEXT"; $why += "; double extension" }
+            # H10 IOC
+            $iocHit = $false
+            if ($nIoc -gt 0) {
+                $hits = ""
+                foreach ($t in $IOCS) {
+                    if ($fpL.IndexOf($t) -ge 0) {
+                        if ($hits -ne "") { $hits += ", " }
+                        $hits += $t
+                        if ($hits.Length -gt 120) { break }
+                    }
+                }
+                if ($hits -ne "") { $iocHit = $true; $jIoc++; $score += 5; $tags += "|IOC"; $why += "; IOC hit: " + $hits }
+            }
+
+            $entN = 0; [void][int]::TryParse($f[$cEntry], [ref]$entN)
+            $seqN = 0; [void][int]::TryParse($f[$cSeq], [ref]$seqN)
+            # slots 11-13: internal flags for post-passes (ioc, create, interesting) - stripped at emit
+            # risky-ext ONLY: user-path alone would sweep in all AppData cache/temp churn
+            $interesting = $risky
+            $row = @($ts, $fn, $extL, $entN, $seqN, $pp, $upd, $f[$cAttr], $score,
+                     $tags, $why, $(if ($iocHit) {1} else {0}), $(if ($isCreate) {1} else {0}),
+                     $(if ($interesting) {1} else {0}))
+            $jRows.Add($row)
+
+            if ($isCreate) {
+                $ppL = $pp.ToLowerInvariant()
+                if (-not $burst.ContainsKey($ppL)) { $burst[$ppL] = New-Object 'System.Collections.Generic.List[object[]]' }
+                $burst[$ppL].Add($row)
+            }
+            if (($jTotal % 100000) -eq 0) { Say ("      ... " + $jTotal.ToString("N0") + " USN rows") }
+        }
+    } finally { $srj.Close() }
+    Say ("      `$J: " + $jTotal.ToString("N0") + " rows parsed (" + $jIoc.ToString("N0") + " IOC hits)")
+
+    # ---- post-pass H4 CRTDEL: created AND deleted within window, tag all rows of that entry
+    Say "[4/6] Post-passes (CRTDEL, BURST) ..."
+    $crtdel = @{}
+    $fmt = "yyyy-MM-dd HH:mm:ss"
+    $ci = [System.Globalization.CultureInfo]::InvariantCulture
+    foreach ($k in $creTs.Keys) {
+        if ($delTs.ContainsKey($k)) {
+            try {
+                $c = [datetime]::ParseExact($creTs[$k], $fmt, $ci)
+                $d = [datetime]::ParseExact($delTs[$k], $fmt, $ci)
+                if ($d -ge $c -and ($d - $c).TotalHours -le $CRTDEL_HOURS) { $crtdel[$k] = $true }
+            } catch { }
+        }
+    }
+    # ---- post-pass H8 BURST: >= BURST_N FileCreates in same dir within BURST_SECS
+    # epoch-seconds computed once per row; the timestamp format sorts lexicographically
+    $burstRows = New-Object 'System.Collections.Generic.HashSet[object]'
+    $epoch = [datetime]::new(1970,1,1)
+    foreach ($ppL in $burst.Keys) {
+        $list = $burst[$ppL]
+        if ($list.Count -lt $BURST_N) { continue }
+        $keys = New-Object 'string[]' $list.Count
+        $items = $list.ToArray()
+        for ($k = 0; $k -lt $items.Length; $k++) { $keys[$k] = [string]$items[$k][0] }
+        [System.Array]::Sort($keys, $items)
+        $secs = New-Object 'long[]' $keys.Length
+        for ($k = 0; $k -lt $keys.Length; $k++) {
+            try { $secs[$k] = [long]([datetime]::ParseExact($keys[$k], $fmt, $ci) - $epoch).TotalSeconds } catch { $secs[$k] = 0 }
+        }
+        # overlapping windows must not re-add the same items (quadratic otherwise)
+        $lo = 0; $marked = -1
+        for ($hi = 0; $hi -lt $items.Length; $hi++) {
+            while ($lo -lt $hi -and ($secs[$hi] - $secs[$lo]) -gt $BURST_SECS) { $lo++ }
+            if (($hi - $lo + 1) -ge $BURST_N) {
+                $start = $lo; if ($marked + 1 -gt $start) { $start = $marked + 1 }
+                for ($k = $start; $k -le $hi; $k++) { [void]$burstRows.Add($items[$k]) }
+                $marked = $hi
+            }
+        }
+    }
+    # apply post-pass scores - only to rows that are risky-ext or user-writable-path
+    # ("interesting", slot 13); temp/cache churn earns the pattern but not the score
+    $nCrt = 0; $nBur = 0
+    foreach ($row in $jRows) {
+        if ([int]$row[13] -ne 1) { continue }
+        $key = ([string]$row[3]) + "-" + ([string]$row[4])
+        if ($crtdel.ContainsKey($key)) {
+            $row[8] = [int]$row[8] + 2; $row[9] = ([string]$row[9]) + "|CRTDEL"
+            $row[10] = ([string]$row[10]) + "; created then deleted within " + $CRTDEL_HOURS + "h"
+            $nCrt++
+        }
+        if ($burstRows.Contains($row)) {
+            $row[8] = [int]$row[8] + 1; $row[9] = ([string]$row[9]) + "|BURST"
+            $row[10] = ([string]$row[10]) + "; part of a file-creation burst"
+            $nBur++
+        }
+    }
+    Say ("      CRTDEL entries: " + $crtdel.Count.ToString("N0") + " (interesting rows tagged " + $nCrt.ToString("N0") + "); BURST rows tagged: " + $nBur.ToString("N0"))
+} else {
+    Say "[3/6] No `$J supplied - MFT-only report."
+    Say "[4/6] (skipped)"
+}
+
+# ---------------------------------------------------------------- stage 5: reduce
+Say "[5/6] Reducing to row budget ..."
+
+# --- MFT: tiers already split during parse; assemble in priority order
+$mftKeep = New-Object 'System.Collections.Generic.List[object[]]'
+$mftDrop = @{ t1=0; t2=0; t3=0; t4=0; t5=0; t6=0 }
+function TakeInto([System.Collections.Generic.List[object[]]]$dst, [System.Collections.Generic.List[object[]]]$src, [int]$budget, [string]$tier, [hashtable]$dropStats) {
+    foreach ($r in $src) {
+        if ($dst.Count -lt $budget) { $dst.Add($r) } else { $dropStats[$tier] = $dropStats[$tier] + 1 }
+    }
+}
+TakeInto $mftKeep $t1m $RowBudget "t1" $mftDrop
+TakeInto $mftKeep $t2m $RowBudget "t2" $mftDrop
+TakeInto $mftKeep $t3m $RowBudget "t3" $mftDrop
+TakeInto $mftKeep $t4m $RowBudget "t4" $mftDrop
+TakeInto $mftKeep $t5m $RowBudget "t5" $mftDrop
+# t6 already bounded; count anything beyond budget as dropped
+$t6drop = $mftTotal - $t1m.Count - $t2m.Count - $t3m.Count - $t4m.Count - $t5m.Count - $t6m.Count
+if ($t6drop -lt 0) { $t6drop = 0 }
+$mftDrop["t6"] = $t6drop
+TakeInto $mftKeep $t6m $RowBudget "t6" $mftDrop
+
+# --- J: tier now (post-passes changed scores)
+$jKeep = New-Object 'System.Collections.Generic.List[object[]]'
+$jDrop = @{ t1=0; t2=0; t3=0; t4=0; t5=0; t6=0 }
+if ($haveJ) {
+    $jt = @{ t1=(New-Object 'System.Collections.Generic.List[object[]]'); t2=(New-Object 'System.Collections.Generic.List[object[]]');
+             t3=(New-Object 'System.Collections.Generic.List[object[]]'); t4=(New-Object 'System.Collections.Generic.List[object[]]');
+             t5=(New-Object 'System.Collections.Generic.List[object[]]'); t6=(New-Object 'System.Collections.Generic.List[object[]]') }
+    foreach ($row in $jRows) {
+        $s = [int]$row[8]
+        if ([int]$row[11] -eq 1) { $jt["t1"].Add($row) }
+        elseif ($s -ge 4) { $jt["t2"].Add($row) }
+        elseif ($s -ge 2) { $jt["t3"].Add($row) }
+        elseif ($s -ge 1) { $jt["t4"].Add($row) }
+        else {
+            $ts = [string]$row[0]
+            $inWin = $false
+            if ($haveWin) {
+                $inWin = $true
+                if ($winFrom -ne "" -and $ts.CompareTo($winFrom) -lt 0) { $inWin = $false }
+                if ($winTo -ne "" -and $ts.CompareTo($winTo) -gt 0) { $inWin = $false }
+            }
+            $extL = [string]$row[2]
+            if ($inWin -and $extL.Length -gt 0 -and $RISKYEXT.ContainsKey($extL)) { $jt["t5"].Add($row) }
+            else { $jt["t6"].Add($row) }
+        }
+    }
+    # newest-first within t6
+    $t6j = $jt["t6"]
+    if ($t6j.Count -gt 0) {
+        $keys = New-Object 'string[]' $t6j.Count
+        $items = $t6j.ToArray()
+        for ($k = 0; $k -lt $items.Length; $k++) { $keys[$k] = [string]$items[$k][0] }
+        [System.Array]::Sort($keys, $items)
+        [System.Array]::Reverse($items)
+        $t6j.Clear(); foreach ($it in $items) { $t6j.Add($it) }
+    }
+    TakeInto $jKeep $jt["t1"] $RowBudget "t1" $jDrop
+    TakeInto $jKeep $jt["t2"] $RowBudget "t2" $jDrop
+    TakeInto $jKeep $jt["t3"] $RowBudget "t3" $jDrop
+    TakeInto $jKeep $jt["t4"] $RowBudget "t4" $jDrop
+    TakeInto $jKeep $jt["t5"] $RowBudget "t5" $jDrop
+    TakeInto $jKeep $jt["t6"] $RowBudget "t6" $jDrop
+}
+
+# RECENT tag (context only) on kept rows, anchored to dataset max timestamp
+$recentCut = ""
+$anchor = $maxTsJ; if ($anchor -eq "" -or ($maxTsM -ne "" -and $maxTsM.CompareTo($anchor) -gt 0)) { $anchor = $maxTsM }
+if ($anchor.Length -ge 19) {
+    try {
+        $a = [datetime]::ParseExact($anchor.Substring(0,19), "yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+        $recentCut = $a.AddDays(-$RECENT_DAYS).ToString("yyyy-MM-dd HH:mm:ss")
+    } catch { }
+}
+if ($recentCut -ne "") {
+    foreach ($r in $mftKeep) { if (([string]$r[10]).CompareTo($recentCut) -ge 0) { $r[15] = (([string]$r[15]) + "|RECENT").TrimStart('|') } }
+    foreach ($r in $jKeep)   { if (([string]$r[0]).CompareTo($recentCut) -ge 0)  { $r[9]  = (([string]$r[9])  + "|RECENT").TrimStart('|') } }
+}
+
+Say ("      kept MFT " + $mftKeep.Count.ToString("N0") + "/" + $mftTotal.ToString("N0") +
+     ", J " + $jKeep.Count.ToString("N0") + "/" + $jTotal.ToString("N0"))
+
+# ---------------------------------------------------------------- stage 6: emit report
+Say "[6/6] Emitting report ..."
+$sb = New-Object System.Text.StringBuilder (64MB)
+
+[void]$sb.Append('var DATA={')
+[void]$sb.Append('"meta":{')
+[void]$sb.Append('"host":');       JsonStr $HostLabel $sb
+[void]$sb.Append(',"generated":'); JsonStr ([datetime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss") + " UTC") $sb
+[void]$sb.Append(',"appVersion":'); JsonStr $AppVersion $sb
+[void]$sb.Append(',"mftecmdVersion":'); JsonStr $toolVer $sb
+[void]$sb.Append(',"mftecmdPath":'); JsonStr $MftecmdPath $sb
+[void]$sb.Append(',"inputMft":'); JsonStr $Mft $sb
+[void]$sb.Append(',"inputJ":'); JsonStr $J $sb
+[void]$sb.Append(',"csvDir":'); JsonStr $csvDir $sb
+[void]$sb.Append(',"mftTotal":').Append($mftTotal).Append(',"mftKept":').Append($mftKeep.Count)
+[void]$sb.Append(',"jTotal":').Append($jTotal).Append(',"jKept":').Append($jKeep.Count)
+[void]$sb.Append(',"mftDeleted":').Append($mftDel).Append(',"mftAds":').Append($mftAds)
+[void]$sb.Append(',"mftStomp":').Append($mftStomp).Append(',"iocHits":').Append($mftIoc + $jIoc)
+[void]$sb.Append(',"budget":').Append($RowBudget)
+[void]$sb.Append(',"recentCut":'); JsonStr $recentCut $sb
+[void]$sb.Append(',"winFrom":'); JsonStr $winFrom $sb
+[void]$sb.Append(',"winTo":'); JsonStr $winTo $sb
+[void]$sb.Append(',"mftDrop":{"t1":').Append($mftDrop.t1).Append(',"t2":').Append($mftDrop.t2).Append(',"t3":').Append($mftDrop.t3)
+[void]$sb.Append(',"t4":').Append($mftDrop.t4).Append(',"t5":').Append($mftDrop.t5).Append(',"t6":').Append($mftDrop.t6).Append('}')
+[void]$sb.Append(',"jDrop":{"t1":').Append($jDrop.t1).Append(',"t2":').Append($jDrop.t2).Append(',"t3":').Append($jDrop.t3)
+[void]$sb.Append(',"t4":').Append($jDrop.t4).Append(',"t5":').Append($jDrop.t5).Append(',"t6":').Append($jDrop.t6).Append('}')
+[void]$sb.Append('},')
+
+[void]$sb.Append('"iocs":[')
+for ($i = 0; $i -lt $IOCS.Count; $i++) { if ($i -gt 0) { [void]$sb.Append(',') }; JsonStr $IOCS[$i] $sb }
+[void]$sb.Append('],')
+
+[void]$sb.Append('"cols":{"mft":["entry","seq","deleted","parentPath","fileName","ext","size","isDir","hasAds","zoneId","cr10","cr30","mod10","acc10","score","tags","why"],')
+[void]$sb.Append('"j":["ts","name","ext","entry","seq","parentPath","upd","attrs","score","tags","why"]},')
+
+[void]$sb.Append('"hist":{')
+$first = $true
+foreach ($day in ($hist.Keys | Sort-Object)) {
+    if (-not $first) { [void]$sb.Append(',') }; $first = $false
+    JsonStr $day $sb; [void]$sb.Append(':').Append([int]$hist[$day])
+}
+[void]$sb.Append('},')
+
+[void]$sb.Append('"mft":[')
+$first = $true
+foreach ($r in $mftKeep) {
+    if (-not $first) { [void]$sb.Append(',') }; $first = $false
+    [void]$sb.Append('[').Append([int]$r[0]).Append(',').Append([int]$r[1]).Append(',').Append([int]$r[2]).Append(',')
+    JsonStr ([string]$r[3]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[4]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[5]) $sb; [void]$sb.Append(',')
+    [void]$sb.Append([long]$r[6]).Append(',').Append([int]$r[7]).Append(',').Append([int]$r[8]).Append(',')
+    JsonStr ([string]$r[9]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[10]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[11]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[12]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[13]) $sb; [void]$sb.Append(',')
+    [void]$sb.Append([int]$r[14]).Append(',')
+    JsonStr ([string]$r[15]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[16]) $sb; [void]$sb.Append(']')
+}
+[void]$sb.Append('],')
+
+[void]$sb.Append('"j":[')
+$first = $true
+foreach ($r in $jKeep) {
+    if (-not $first) { [void]$sb.Append(',') }; $first = $false
+    [void]$sb.Append('[')
+    JsonStr ([string]$r[0]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[1]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[2]) $sb; [void]$sb.Append(',')
+    [void]$sb.Append([int]$r[3]).Append(',').Append([int]$r[4]).Append(',')
+    JsonStr ([string]$r[5]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[6]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[7]) $sb; [void]$sb.Append(',')
+    [void]$sb.Append([int]$r[8]).Append(',')
+    JsonStr ([string]$r[9]) $sb; [void]$sb.Append(',')
+    JsonStr ([string]$r[10]) $sb; [void]$sb.Append(']')
+}
+[void]$sb.Append(']};')
+$dataJs = $sb.ToString()
+
+# --- Phase-1 stub viewer. Replaced wholesale by the full viewer in Phase 2.
+# [SCRIPT] / [/SCRIPT] tokens are swapped for real script tags at emit time so the
+# template can survive later embedding inside the HTA payload block.
+$TEMPLATE = @'
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>__TITLE__</title><style>
+:root{--bg:#0d1117;--panel:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--blu:#58a6ff;--red:#ff6b6b;--yel:#d29922;--grn:#3fb950;--pur:#b083f0}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:"Segoe UI",Tahoma,sans-serif;font-size:14px;margin:0;padding:0}
+.mono{font-family:Consolas,"Courier New",monospace}
+a{color:var(--blu)}
+#hdr{padding:10px 16px 6px 16px}
+#hdr h1{font-size:19px;margin:0;display:inline-block}
+.pill{display:inline-block;background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:1px 10px;margin-left:8px;font-size:12px;color:var(--mut);vertical-align:middle}
+.pill b{color:var(--fg)}
+#banner{margin:6px 16px;background:var(--panel);border:1px solid var(--bd);border-left:3px solid var(--yel);border-radius:6px;padding:6px 10px;font-size:12px;color:var(--mut)}
+#bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:4px 16px}
+.tab{background:var(--panel);border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:4px 14px;cursor:pointer;font-size:13px}
+.tab.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+button,select,input{background:var(--panel);border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit}
+button{cursor:pointer} button:hover{border-color:var(--blu)}
+input[type=text]{width:170px} input.dt{width:98px}
+#tagbar{display:flex;flex-wrap:wrap;gap:4px;padding:4px 16px}
+.chip{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:1px 9px;font-size:11.5px;cursor:pointer;color:var(--mut)}
+.chip.on{border-color:var(--blu);color:var(--blu)}
+.chip.zero{opacity:.35;cursor:default}
+.chip b{color:var(--fg);font-weight:600}
+#gridwrap{position:relative;margin:2px 16px 8px 16px;border:1px solid var(--bd);border-radius:6px;overflow:auto;background:var(--panel)}
+#ghead{position:sticky;top:0;z-index:5;background:#1c2129;display:flex;border-bottom:1px solid var(--bd);min-width:1330px}
+#ghead div{padding:5px 8px;font-size:12px;color:var(--mut);cursor:pointer;flex:0 0 auto;overflow:hidden;white-space:nowrap;user-select:none}
+#ghead div:hover{color:var(--blu)}
+#spacer{position:relative;min-width:1330px}
+#rows{position:absolute;left:0;top:0;right:0}
+.r{display:flex;height:24px;line-height:23px;font-size:12px;border-bottom:1px solid #1b2028;cursor:pointer;min-width:1330px}
+.r:hover{background:#1c2532}
+.r div{padding:0 8px;flex:0 0 auto;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.r.sus{background:#2a1416}.r.sus:hover{background:#33191c}
+.r.sus div:first-child{border-left:3px solid var(--red);padding-left:5px}
+.r.sel{outline:1px solid var(--blu)}
+.sc{font-weight:700;color:var(--red)}
+.tag{display:inline-block;border-radius:4px;padding:0 5px;margin:2px 2px 0 0;font-size:10.5px;line-height:16px;background:#21262d;color:var(--mut);vertical-align:middle}
+.tag.IOC,.tag.MASQ{background:#3a1416;color:var(--red);border:1px solid var(--red);line-height:14px}
+.tag.IOCX{background:#3a1416;color:#ffa198;border:1px dashed var(--red);line-height:14px}
+.tag.USERPATH{background:#3a2d10;color:var(--yel)}
+.tag.LOLBIN{background:#10263f;color:var(--blu)}
+.tag.RANDOM,.tag.TIMESTOMP{background:#241a3a;color:var(--pur)}
+.tag.DBLEXT,.tag.CRTDEL{background:#3a1416;color:var(--red)}
+.tag.DELETED{background:#21262d;color:#c9d1d9}
+#ov{padding:0 16px 16px 16px;display:none}
+.card{background:var(--panel);border:1px solid var(--bd);border-radius:6px;padding:12px;margin-top:10px}
+.card h3{margin:0 0 8px 0;font-size:14px}
+.stat{display:inline-block;margin-right:26px;margin-bottom:4px}
+.stat b{font-size:19px}.stat span{color:var(--mut);font-size:11.5px;display:block}
+.cards3{display:flex;gap:10px;flex-wrap:wrap}
+.col3{flex:1 1 300px;background:var(--panel);border:1px solid var(--bd);border-radius:6px;padding:12px;min-width:300px}
+.col3 h3{margin:0 0 8px 0;font-size:13.5px}
+.li{font-size:12px;padding:3px 0;border-bottom:1px solid #1b2028;cursor:pointer;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.li:hover{color:var(--blu)}
+.li .muted{color:var(--mut)}
+#histo{display:flex;align-items:flex-end;gap:2px;height:110px;padding-top:6px;overflow-x:auto}
+.hb{flex:0 0 14px;background:#1f6feb;border-radius:2px 2px 0 0;cursor:pointer;min-height:2px}
+.hb:hover{background:var(--blu)}
+.hlbl{font-size:10px;color:var(--mut);transform:none;text-align:center}
+#detail{position:fixed;top:0;right:-540px;width:520px;height:100%;background:#11151c;border-left:1px solid var(--bd);z-index:50;transition:right .15s;overflow-y:auto;padding:14px;font-size:12.5px}
+#detail.open{right:0;box-shadow:-8px 0 24px rgba(0,0,0,.5)}
+#detail h2{font-size:15px;margin:0 40px 8px 0;word-break:break-all}
+#detail table{border-collapse:collapse;width:100%;font-size:12px}
+#detail td{padding:3px 6px;border-bottom:1px solid #1b2028;vertical-align:top;word-break:break-all}
+#detail td:first-child{color:var(--mut);white-space:nowrap;width:110px}
+.stomp{color:var(--pur);font-weight:700}
+#dx{position:absolute;top:8px;right:10px;font-size:20px;cursor:pointer;color:var(--mut)}#dx:hover{color:var(--fg)}
+.dwhy{background:#1c2129;border-radius:6px;padding:8px;margin:8px 0}
+.rel{padding:3px 6px;border-bottom:1px solid #1b2028;cursor:pointer;font-size:11.5px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.rel:hover{background:#1c2532}
+#iocbox{display:none;padding:6px 16px}
+#iocbox textarea{width:60%;height:52px;background:var(--panel);border:1px solid var(--bd);color:var(--fg);border-radius:6px;font-family:Consolas,monospace;font-size:12px;padding:6px}
+.cave{color:var(--yel);font-size:11.5px;margin-left:8px}
+#foot{padding:6px 16px 14px 16px;color:var(--mut);font-size:11.5px}
+.zone{background:#1c2129;border:1px solid var(--bd);border-radius:6px;padding:6px;font-size:11.5px;word-break:break-all;color:var(--yel)}
+#msg{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#1f6feb;color:#fff;border-radius:6px;padding:6px 16px;font-size:12.5px;display:none;z-index:99}
+</style></head><body>
+<div id="hdr">
+  <h1>__TITLE__</h1>
+  <span class="pill" id="pillGen"></span>
+  <span class="pill" id="pillVer"></span>
+  <span class="pill" id="pillTz"><b>UTC</b> everywhere</span>
+</div>
+<div id="banner"></div>
+<div id="bar">
+  <span class="tab on" id="tabOv">Overview</span>
+  <span class="tab" id="tabJ">Timeline ($J)</span>
+  <span class="tab" id="tabM">Files ($MFT)</span>
+  <input type="text" id="q" placeholder="search name / path / tags">
+  <input type="text" class="dt mono" id="d1" placeholder="from YYYY-MM-DD">
+  <input type="text" class="dt mono" id="d2" placeholder="to YYYY-MM-DD">
+  <select id="extq"><option value="">ext: all</option><option>exe</option><option>dll</option><option>sys</option><option>ps1</option><option>bat</option><option>cmd</option><option>vbs</option><option>js</option><option>hta</option><option>jar</option><option>lnk</option><option>7z</option><option>zip</option><option>rar</option><option>iso</option></select>
+  <input type="text" id="pscope" placeholder="path contains" style="width:130px">
+  <button id="bClear">Clear</button>
+  <button id="bIoc">IOC+</button>
+  <button id="bCsv">Export CSV</button>
+  <button id="bNotes">Copy case notes</button>
+  <button id="bFm" title="smaller text">A-</button>
+  <button id="bFp" title="larger text">A+</button>
+</div>
+<div id="iocbox">
+  <textarea id="iocTxt" placeholder="ad-hoc terms, comma or newline separated"></textarea>
+  <button id="bIocGo" style="vertical-align:top">Apply</button>
+  <span class="cave">ad-hoc terms search only the embedded subset; re-run from the launcher to sweep all rows</span>
+</div>
+<div id="tagbar"></div>
+<div id="ov"></div>
+<div id="gridwrap" style="display:none">
+  <div id="ghead"></div>
+  <div id="spacer"><div id="rows"></div></div>
+</div>
+<div id="detail"><span id="dx">&times;</span><div id="dbody"></div></div>
+<div id="foot"></div>
+<div id="msg"></div>
+[SCRIPT]
+/*__DATA__*/
+[/SCRIPT]
+[SCRIPT]
+"use strict";
+// ---- column index constants (must match engine emit layout)
+var M={E:0,SEQ:1,DEL:2,PP:3,FN:4,EXT:5,SIZE:6,DIR:7,ADS:8,ZONE:9,CR10:10,CR30:11,MOD10:12,ACC10:13,SC:14,TAGS:15,WHY:16};
+var J={TS:0,NAME:1,EXT:2,ENT:3,SEQ:4,PP:5,UPD:6,ATTR:7,SC:8,TAGS:9,WHY:10};
+var ROWH=24, meta=DATA.meta;
+function $(id){return document.getElementById(id)}
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
+function nfmt(n){return Number(n).toLocaleString()}
+function toast(t){var m=$("msg");m.textContent=t;m.style.display="block";setTimeout(function(){m.style.display="none"},2200)}
+
+// ---- one-time prep: lowercase search blobs + entry index
+var mftBlob=new Array(DATA.mft.length), jBlob=new Array(DATA.j.length);
+var entryIdx={}; // "entry-seq" -> {m:mftIdx, j:[jIdx]}
+(function(){
+  var i,r,k;
+  for(i=0;i<DATA.mft.length;i++){r=DATA.mft[i];
+    mftBlob[i]=(r[M.PP]+"\\"+r[M.FN]+"|"+r[M.EXT]+"|"+r[M.TAGS]+"|"+r[M.WHY]+"|"+r[M.ZONE]).toLowerCase();
+    k=r[M.E]+"-"+r[M.SEQ]; if(!entryIdx[k])entryIdx[k]={m:-1,j:[]}; entryIdx[k].m=i;}
+  for(i=0;i<DATA.j.length;i++){r=DATA.j[i];
+    jBlob[i]=(r[J.PP]+"\\"+r[J.NAME]+"|"+r[J.EXT]+"|"+r[J.TAGS]+"|"+r[J.WHY]+"|"+r[J.UPD]).toLowerCase();
+    k=r[J.ENT]+"-"+r[J.SEQ]; if(!entryIdx[k])entryIdx[k]={m:-1,j:[]}; entryIdx[k].j.push(i);}
+})();
+var adhocM={}, adhocJ={}, adhocOn=false;
+
+// ---- header pills / banner / footer
+$("pillGen").innerHTML="generated <b>"+esc(meta.generated)+"</b>";
+$("pillVer").innerHTML="engine <b>"+esc(meta.appVersion)+"</b> &middot; MFTECmd <b>"+esc(meta.mftecmdVersion)+"</b>";
+(function(){
+  var dm=0,dj=0,k;for(k in meta.mftDrop)dm+=meta.mftDrop[k];for(k in meta.jDrop)dj+=meta.jDrop[k];
+  $("banner").innerHTML="Showing <b>"+nfmt(meta.mftKept)+"</b> of "+nfmt(meta.mftTotal)+" $MFT rows and <b>"+nfmt(meta.jKept)+"</b> of "+nfmt(meta.jTotal)+
+    " $J rows (budget "+nfmt(meta.budget)+"/set; "+nfmt(dm)+" / "+nfmt(dj)+" lowest-priority rows not embedded). "+
+    "IOC terms baked at parse time: "+DATA.iocs.length+". Full CSVs: <span class='mono'>"+esc(meta.csvDir)+"</span>";
+  $("foot").innerHTML="Host <b>"+esc(meta.host)+"</b> &middot; input "+esc(meta.inputMft)+(meta.inputJ?" + $J":" (no $J)")+
+    " &middot; window "+(meta.winFrom?esc(meta.winFrom)+" .. "+esc(meta.winTo):"none")+" &middot; recent-cut "+esc(meta.recentCut)+
+    " &middot; all timestamps UTC as emitted by MFTECmd";
+})();
+
+// ---- filter state (shared across views)
+var VIEW="ov", SORT={j:{k:J.SC,d:-1,k2:J.TS},m:{k:M.SC,d:-1,k2:M.CR10}};
+var TAGSEL="ALL";
+var filtered=[];   // raw indexes into active dataset
+var TAGLIST=["SUS","IOC","IOCX","USERPATH","TIMESTOMP","ADS","DELETED","MASQ","DBLEXT","CRTDEL","BURST","RANDOM","LOLBIN","RECENT"];
+
+function activeRows(){return VIEW==="j"?DATA.j:DATA.mft}
+function activeBlob(){return VIEW==="j"?jBlob:mftBlob}
+function susOf(r){return VIEW==="j"?r[J.SC]>=2:r[M.SC]>=3}
+function tsOf(r){return VIEW==="j"?r[J.TS]:r[M.CR10]}
+function tagsOf(r){return VIEW==="j"?r[J.TAGS]:r[M.TAGS]}
+function extOf(r){return VIEW==="j"?r[J.EXT]:r[M.EXT]}
+function ppOf(r){return VIEW==="j"?r[J.PP]:r[M.PP]}
+function adhocSet(){return VIEW==="j"?adhocJ:adhocM}
+
+function hasTag(r,i,t){
+  if(t==="ALL")return true;
+  if(t==="SUS")return susOf(r);
+  if(t==="IOCX")return !!adhocSet()[i];
+  return (tagsOf(r)+"").indexOf(t)>=0;
+}
+
+function applyFilters(){
+  var rows=activeRows(), blob=activeBlob(), out=[], counts={ALL:0};
+  var q=$("q").value.trim().toLowerCase();
+  var d1=$("d1").value.trim(), d2=$("d2").value.trim();
+  if(d1)d1+=" 00:00:00"; if(d2)d2+=" 23:59:59";
+  var ext=$("extq").value, ps=$("pscope").value.trim().toLowerCase();
+  var i,r,ok,t;
+  for(t=0;t<TAGLIST.length;t++)counts[TAGLIST[t]]=0;
+  for(i=0;i<rows.length;i++){r=rows[i];
+    ok=true;
+    if(q&&blob[i].indexOf(q)<0)ok=false;
+    if(ok&&d1&&tsOf(r)<d1)ok=false;
+    if(ok&&d2&&tsOf(r)>d2)ok=false;
+    if(ok&&ext&&extOf(r)!==ext)ok=false;
+    if(ok&&ps&&(ppOf(r)+"").toLowerCase().indexOf(ps)<0)ok=false;
+    if(!ok)continue;
+    counts.ALL++;
+    for(t=0;t<TAGLIST.length;t++){if(hasTag(r,i,TAGLIST[t]))counts[TAGLIST[t]]++}
+    if(hasTag(r,i,TAGSEL))out.push(i);
+  }
+  filtered=out;
+  sortNow();
+  renderTagbar(counts);
+  layoutGrid();
+}
+function sortNow(){
+  var rows=activeRows(), s=VIEW==="j"?SORT.j:SORT.m, k=s.k, d=s.d, k2=s.k2;
+  filtered.sort(function(a,b){
+    var x=rows[a][k], y=rows[b][k];
+    if(x<y)return -d; if(x>y)return d;
+    x=rows[a][k2]; y=rows[b][k2];
+    if(x<y)return 1; if(x>y)return -1; return 0;
+  });
+}
+function renderTagbar(counts){
+  var h='<span class="chip'+(TAGSEL==="ALL"?" on":"")+'" data-t="ALL">ALL <b>'+nfmt(counts.ALL)+'</b></span>',t,n;
+  for(var i=0;i<TAGLIST.length;i++){t=TAGLIST[i];n=counts[t]||0;
+    if(t==="IOCX"&&!adhocOn)continue;
+    h+='<span class="chip'+(TAGSEL===t?" on":"")+(n?"":" zero")+'" data-t="'+t+'">'+(t==="IOCX"?"IOC+":t)+' <b>'+nfmt(n)+'</b></span>';}
+  $("tagbar").innerHTML=h;
+}
+$("tagbar").onclick=function(e){
+  var t=e.target.closest(".chip"); if(!t)return;
+  if(t.classList.contains("zero")&&t.dataset.t!==TAGSEL)return;
+  TAGSEL=(TAGSEL===t.dataset.t)?"ALL":t.dataset.t; applyFilters();
+};
+
+// ---- grid (virtualized)
+var COLS_J=[
+ {h:"Score",w:52,g:function(r){return '<span class="sc">'+(r[J.SC]||"")+'</span>'},k:J.SC},
+ {h:"Tags",w:180,g:function(r,i){return tagHtml(r[J.TAGS],adhocJ[i])},k:J.SC},
+ {h:"Timestamp (UTC)",w:150,g:function(r){return '<span class="mono">'+esc(r[J.TS])+'</span>'},k:J.TS},
+ {h:"Name",w:230,g:function(r){return '<span class="mono">'+esc(r[J.NAME])+'</span>'},k:J.NAME},
+ {h:"Parent path",w:430,g:function(r){return '<span class="mono">'+esc(r[J.PP])+'</span>'},k:J.PP},
+ {h:"Update reasons",w:240,g:function(r){return esc(r[J.UPD])},k:J.UPD},
+ {h:"Ext",w:48,g:function(r){return esc(r[J.EXT])},k:J.EXT}];
+var COLS_M=[
+ {h:"Score",w:52,g:function(r){return '<span class="sc">'+(r[M.SC]||"")+'</span>'},k:M.SC},
+ {h:"Tags",w:180,g:function(r,i){return tagHtml(r[M.TAGS],adhocM[i])},k:M.SC},
+ {h:"Created 0x10 (UTC)",w:150,g:function(r){return '<span class="mono">'+esc(r[M.CR10])+'</span>'},k:M.CR10},
+ {h:"Name",w:230,g:function(r){return '<span class="mono">'+esc(r[M.FN])+'</span>'},k:M.FN},
+ {h:"Parent path",w:430,g:function(r){return '<span class="mono">'+esc(r[M.PP])+'</span>'},k:M.PP},
+ {h:"Ext",w:48,g:function(r){return esc(r[M.EXT])},k:M.EXT},
+ {h:"Size",w:90,g:function(r){return nfmt(r[M.SIZE])},k:M.SIZE},
+ {h:"Del",w:40,g:function(r){return r[M.DEL]?"Y":""},k:M.DEL},
+ {h:"ADS",w:44,g:function(r){return r[M.ADS]?"Y":""},k:M.ADS}];
+function cols(){return VIEW==="j"?COLS_J:COLS_M}
+function tagHtml(t,adhoc){
+  var o="",a,i; if(t){a=String(t).split("|");
+    for(i=0;i<a.length;i++)if(a[i])o+='<span class="tag '+esc(a[i])+'">'+esc(a[i])+'</span>';}
+  if(adhoc)o+='<span class="tag IOCX">IOC+</span>';
+  return o;
+}
+var ARR_UP=" "+String.fromCharCode(9650), ARR_DN=" "+String.fromCharCode(9660);
+function renderHead(){
+  var s=VIEW==="j"?SORT.j:SORT.m, c=cols(), h="",i,arr;
+  for(i=0;i<c.length;i++){
+    arr=(s.k===c[i].k)?(s.d>0?ARR_UP:ARR_DN):"";
+    h+='<div data-k="'+c[i].k+'" style="width:'+c[i].w+'px">'+esc(c[i].h)+arr+'</div>';}
+  $("ghead").innerHTML=h;
+}
+$("ghead").onclick=function(e){
+  var t=e.target.closest("div[data-k]"); if(!t)return;
+  var s=VIEW==="j"?SORT.j:SORT.m, k=parseInt(t.dataset.k,10);
+  if(s.k===k)s.d=-s.d; else {s.k=k;s.d=-1;}
+  sortNow(); layoutGrid(); renderHead();
+};
+var gw=$("gridwrap"), spacer=$("spacer"), rowsEl=$("rows");
+function layoutGrid(){
+  spacer.style.height=(filtered.length*ROWH)+"px";
+  renderWindow(true);
+}
+var lastFirst=-1;
+function renderWindow(force){
+  var first=Math.floor(gw.scrollTop/ROWH)-5; if(first<0)first=0;
+  if(!force&&first===lastFirst)return;
+  lastFirst=first;
+  var vis=Math.ceil(gw.clientHeight/ROWH)+10;
+  var last=Math.min(filtered.length,first+vis);
+  var rows=activeRows(), c=cols(), h="",i,j,r,ri;
+  for(i=first;i<last;i++){ri=filtered[i];r=rows[ri];
+    h+='<div class="r'+(susOf(r)?" sus":"")+(ri===selIdx?" sel":"")+'" data-ri="'+ri+'">';
+    for(j=0;j<c.length;j++)h+='<div style="width:'+c[j].w+'px">'+c[j].g(r,ri)+'</div>';
+    h+='</div>';}
+  rowsEl.style.top=(first*ROWH)+"px";
+  rowsEl.innerHTML=h;
+}
+var raf=null;
+gw.onscroll=function(){if(raf)return;raf=requestAnimationFrame(function(){raf=null;renderWindow(false)})};
+window.onresize=function(){sizeGrid();renderWindow(true)};
+function sizeGrid(){gw.style.height=Math.max(220,window.innerHeight-gw.getBoundingClientRect().top-46)+"px"}
+
+// ---- detail pane
+var selIdx=-1;
+rowsEl.onclick=function(e){
+  var t=e.target.closest(".r"); if(!t)return;
+  openDetail(VIEW,parseInt(t.dataset.ri,10));
+};
+$("dx").onclick=function(){$("detail").classList.remove("open");selIdx=-1;renderWindow(true)};
+document.addEventListener("keydown",function(e){if(e.key==="Escape")$("dx").onclick()});
+function openDetail(ds,ri){
+  selIdx=(ds===VIEW)?ri:-1;
+  var h="";
+  if(ds==="j")h=detailJ(ri); else h=detailM(ri);
+  $("dbody").innerHTML=h;
+  $("detail").classList.add("open");
+  renderWindow(true);
+  var cb=$("bCopyRec"); if(cb)cb.onclick=function(){copyText(cb.dataset.txt);toast("record copied")};
+  var rels=document.querySelectorAll(".rel[data-ds]");
+  for(var i=0;i<rels.length;i++)rels[i].onclick=function(){openDetail(this.dataset.ds,parseInt(this.dataset.ri,10))};
+}
+function trow(k,v,cls){return "<tr><td>"+esc(k)+"</td><td class='"+(cls||"mono")+"'>"+v+"</td></tr>"}
+function detailM(ri){
+  var r=DATA.mft[ri], key=r[M.E]+"-"+r[M.SEQ], stomp=(r[M.TAGS]+"").indexOf("TIMESTOMP")>=0;
+  var h="<h2 class='mono'>"+esc(r[M.PP]+"\\"+r[M.FN])+"</h2>";
+  h+="<div>"+tagHtml(r[M.TAGS],adhocM[ri])+" <span class='sc'>score "+r[M.SC]+"</span></div>";
+  if(r[M.WHY])h+="<div class='dwhy'>"+esc(r[M.WHY]).replace(/; /g,"<br>")+"</div>";
+  h+="<table>";
+  h+=trow("Entry-Seq",key);
+  h+=trow("Created 0x10",'<span class="'+(stomp?"stomp":"")+'">'+esc(r[M.CR10])+"</span>");
+  h+=trow("Created 0x30",'<span class="'+(stomp?"stomp":"")+'">'+esc(r[M.CR30]||"(same as 0x10)")+"</span>");
+  h+=trow("Modified 0x10",esc(r[M.MOD10]));
+  h+=trow("Accessed 0x10",esc(r[M.ACC10]));
+  h+=trow("Size",nfmt(r[M.SIZE]));
+  h+=trow("Flags",(r[M.DIR]?"directory ":"")+(r[M.DEL]?"DELETED ":"in use ")+(r[M.ADS]?"has-ADS":""));
+  h+="</table>";
+  if(r[M.ZONE])h+="<div style='margin-top:8px'><b>Zone.Identifier (download source)</b><div class='zone mono'>"+esc(r[M.ZONE])+"</div></div>";
+  h+=relatedHtml(key,"m",ri);
+  h+=copyBtn(["MFT record",r[M.PP]+"\\"+r[M.FN],"entry "+key+"  score "+r[M.SC]+"  ["+r[M.TAGS]+"]",
+    "cr0x10 "+r[M.CR10]+"  cr0x30 "+(r[M.CR30]||"=")+"  mod "+r[M.MOD10],
+    "size "+r[M.SIZE]+(r[M.DEL]?"  DELETED":"")+(r[M.WHY]?"\n"+r[M.WHY]:"")].join("\n"));
+  return h;
+}
+function detailJ(ri){
+  var r=DATA.j[ri], key=r[J.ENT]+"-"+r[J.SEQ];
+  var h="<h2 class='mono'>"+esc(r[J.PP]+"\\"+r[J.NAME])+"</h2>";
+  h+="<div>"+tagHtml(r[J.TAGS],adhocJ[ri])+" <span class='sc'>score "+r[J.SC]+"</span></div>";
+  if(r[J.WHY])h+="<div class='dwhy'>"+esc(r[J.WHY]).replace(/; /g,"<br>")+"</div>";
+  h+="<table>";
+  h+=trow("Timestamp",esc(r[J.TS]));
+  h+=trow("Entry-Seq",key);
+  h+=trow("Update reasons",esc(r[J.UPD]),"");
+  h+=trow("Attributes",esc(r[J.ATTR]),"");
+  h+="</table>";
+  h+=relatedHtml(key,"j",ri);
+  h+=copyBtn(["USN event",r[J.PP]+"\\"+r[J.NAME],"entry "+key+"  score "+r[J.SC]+"  ["+r[J.TAGS]+"]",
+    r[J.TS]+"  "+r[J.UPD]+(r[J.WHY]?"\n"+r[J.WHY]:"")].join("\n"));
+  return h;
+}
+function relatedHtml(key,self,selfRi){
+  var e=entryIdx[key], h="", i, r;
+  if(!e)return h;
+  h+="<div style='margin-top:10px'><b>Story of entry "+esc(key)+"</b></div>";
+  if(e.m>=0){r=DATA.mft[e.m];
+    if(!(self==="m"&&e.m===selfRi))
+      h+="<div class='rel mono' data-ds='m' data-ri='"+e.m+"'>MFT: "+esc(r[M.FN])+"  cr "+esc(r[M.CR10])+(r[M.DEL]?"  DELETED":"")+"  score "+r[M.SC]+"</div>";
+  } else if(self==="j") h+="<div class='rel' style='cursor:default;color:#8b949e'>MFT record not in embedded set (deleted+recycled or below budget)</div>";
+  if(e.j.length){
+    var cap=Math.min(e.j.length,120);
+    for(i=0;i<cap;i++){if(self==="j"&&e.j[i]===selfRi)continue;r=DATA.j[e.j[i]];
+      h+="<div class='rel mono' data-ds='j' data-ri='"+e.j[i]+"'>"+esc(r[J.TS])+"  "+esc(r[J.UPD])+"</div>";}
+    if(e.j.length>cap)h+="<div class='rel' style='cursor:default;color:#8b949e'>("+(e.j.length-cap)+" more events)</div>";
+  } else if(self==="m") h+="<div class='rel' style='cursor:default;color:#8b949e'>no embedded $J events for this entry (journal window or budget)</div>";
+  return h;
+}
+function copyBtn(txt){return "<div style='margin-top:12px'><button id='bCopyRec' data-txt=\""+esc(txt)+"\">Copy record</button></div>"}
+function copyText(t){
+  var ta=document.createElement("textarea");ta.value=t;document.body.appendChild(ta);
+  ta.select();try{document.execCommand("copy")}catch(e){}document.body.removeChild(ta);
+}
+
+// ---- overview
+function renderOverview(){
+  var h="",i,r;
+  h+="<div class='card'>"
+   +"<div class='stat'><b>"+nfmt(meta.mftTotal)+"</b><span>MFT records</span></div>"
+   +"<div class='stat'><b>"+nfmt(meta.jTotal)+"</b><span>USN events</span></div>"
+   +"<div class='stat'><b>"+nfmt(meta.mftDeleted)+"</b><span>deleted files</span></div>"
+   +"<div class='stat'><b>"+nfmt(meta.mftStomp)+"</b><span>SI&lt;FN flagged</span></div>"
+   +"<div class='stat'><b>"+nfmt(meta.mftAds)+"</b><span>with ADS</span></div>"
+   +"<div class='stat'><b>"+nfmt(meta.iocHits)+"</b><span>IOC hits</span></div>"
+   +"<div class='stat'><b>"+nfmt(meta.mftKept)+" / "+nfmt(meta.jKept)+"</b><span>embedded MFT / $J</span></div>"
+   +"</div>";
+  // histogram (full $J set, computed pre-reduction)
+  var days=Object.keys(DATA.hist).sort(), max=1;
+  for(i=0;i<days.length;i++)if(DATA.hist[days[i]]>max)max=DATA.hist[days[i]];
+  if(days.length){
+    h+="<div class='card'><h3>$J activity by day (full journal, "+nfmt(meta.jTotal)+" events) &mdash; click a bar to open that day in Timeline</h3><div id='histo'>";
+    for(i=0;i<days.length;i++){
+      var pct=Math.max(2,Math.round(DATA.hist[days[i]]/max*100));
+      h+="<div style='text-align:center'><div class='hb' data-day='"+esc(days[i])+"' style='height:"+pct+"px' title='"+esc(days[i])+": "+nfmt(DATA.hist[days[i]])+" events'></div><div class='hlbl'>"+esc(days[i].substring(5))+"</div></div>";}
+    h+="</div></div>";
+  }
+  // 3-col dashboard
+  var topM=[],topX=[],dirs={},dl=[];
+  var idx=[];for(i=0;i<DATA.mft.length;i++)idx.push(i);
+  idx.sort(function(a,b){var x=DATA.mft[a],y=DATA.mft[b];if(y[M.SC]!==x[M.SC])return y[M.SC]-x[M.SC];return y[M.CR10]<x[M.CR10]?-1:1});
+  for(i=0;i<idx.length&&topM.length<12;i++){r=DATA.mft[idx[i]];if(r[M.SC]>=3)topM.push(idx[i]);else break}
+  for(i=0;i<idx.length&&topX.length<12;i++){r=DATA.mft[idx[i]];if(r[M.EXT]==="exe"||r[M.EXT]==="dll"||r[M.EXT]==="sys")topX.push(idx[i])}
+  topX.sort(function(a,b){return DATA.mft[b][M.CR10]<DATA.mft[a][M.CR10]?-1:1});topX=topX.slice(0,12);
+  for(i=0;i<DATA.j.length;i++){r=DATA.j[i];if((r[J.UPD]+"").indexOf("FileCreate")>=0){dirs[r[J.PP]]=(dirs[r[J.PP]]||0)+1}}
+  for(var d in dirs)dl.push([d,dirs[d]]); dl.sort(function(a,b){return b[1]-a[1]}); dl=dl.slice(0,12);
+  h+="<div class='cards3'>";
+  h+="<div class='col3'><h3>Top suspicious MFT records</h3>";
+  if(!topM.length)h+="<div class='li' style='cursor:default'>none at score &gt;= 3</div>";
+  for(i=0;i<topM.length;i++){r=DATA.mft[topM[i]];
+    h+="<div class='li mono' data-ds='m' data-ri='"+topM[i]+"' title='"+esc(r[M.PP]+"\\"+r[M.FN])+"'><span class='sc'>"+r[M.SC]+"</span> "+esc(r[M.FN])+" <span class='muted'>"+esc(r[M.CR10])+"</span></div>";}
+  h+="</div>";
+  h+="<div class='col3'><h3>Busiest dirs by file-creates <span class='muted'>(embedded $J)</span></h3>";
+  for(i=0;i<dl.length;i++)h+="<div class='li mono' data-dir=\""+esc(dl[i][0])+"\" title='"+esc(dl[i][0])+"'>"+nfmt(dl[i][1])+"  "+esc(dl[i][0])+"</div>";
+  h+="</div>";
+  h+="<div class='col3'><h3>Newest executables (exe/dll/sys)</h3>";
+  for(i=0;i<topX.length;i++){r=DATA.mft[topX[i]];
+    h+="<div class='li mono' data-ds='m' data-ri='"+topX[i]+"' title='"+esc(r[M.PP]+"\\"+r[M.FN])+"'>"+esc(r[M.CR10])+" <span class='muted'>"+esc(r[M.FN])+"</span></div>";}
+  h+="</div></div>";
+  $("ov").innerHTML=h;
+  var lis=document.querySelectorAll("#ov .li[data-ds]");
+  for(i=0;i<lis.length;i++)lis[i].onclick=function(){openDetail(this.dataset.ds,parseInt(this.dataset.ri,10))};
+  lis=document.querySelectorAll("#ov .li[data-dir]");
+  for(i=0;i<lis.length;i++)lis[i].onclick=function(){setView("j");$("pscope").value=this.dataset.dir;applyFilters()};
+  var hbs=document.querySelectorAll("#ov .hb");
+  for(i=0;i<hbs.length;i++)hbs[i].onclick=function(){$("d1").value=this.dataset.day;$("d2").value=this.dataset.day;setView("j")};
+}
+
+// ---- view switching
+function setView(v){
+  VIEW=v;
+  $("tabOv").className="tab"+(v==="ov"?" on":"");
+  $("tabJ").className="tab"+(v==="j"?" on":"");
+  $("tabM").className="tab"+(v==="m"?" on":"");
+  $("ov").style.display=(v==="ov")?"block":"none";
+  $("gridwrap").style.display=(v==="ov")?"none":"block";
+  $("tagbar").style.display=(v==="ov")?"none":"flex";
+  if(v==="ov"){renderOverview();return}
+  if(v==="j"&&!DATA.j.length){toast("no $J data in this report")}
+  renderHead(); sizeGrid(); gw.scrollTop=0; lastFirst=-1; applyFilters();
+}
+$("tabOv").onclick=function(){setView("ov")};
+$("tabJ").onclick=function(){setView("j")};
+$("tabM").onclick=function(){setView("m")};
+
+// ---- filter inputs
+var deb=null;
+function refire(){if(VIEW==="ov")return;if(deb)clearTimeout(deb);deb=setTimeout(applyFilters,200)}
+$("q").oninput=refire; $("d1").oninput=refire; $("d2").oninput=refire;
+$("extq").onchange=function(){if(VIEW!=="ov")applyFilters()};
+$("pscope").oninput=refire;
+$("bClear").onclick=function(){$("q").value="";$("d1").value="";$("d2").value="";$("extq").value="";$("pscope").value="";TAGSEL="ALL";if(VIEW!=="ov")applyFilters()};
+
+// ---- ad-hoc IOC
+$("bIoc").onclick=function(){var b=$("iocbox");b.style.display=(b.style.display==="block")?"none":"block"};
+$("bIocGo").onclick=function(){
+  var terms=$("iocTxt").value.split(/[,\r\n]+/).map(function(s){return s.trim().toLowerCase()}).filter(function(s){return s&&s.charAt(0)!=="#"});
+  adhocM={};adhocJ={};adhocOn=terms.length>0;
+  var i,t,hit;
+  if(adhocOn){
+    for(i=0;i<mftBlob.length;i++){hit=false;for(t=0;t<terms.length;t++)if(mftBlob[i].indexOf(terms[t])>=0){hit=true;break}if(hit)adhocM[i]=1}
+    for(i=0;i<jBlob.length;i++){hit=false;for(t=0;t<terms.length;t++)if(jBlob[i].indexOf(terms[t])>=0){hit=true;break}if(hit)adhocJ[i]=1}
+  }
+  var nm=Object.keys(adhocM).length,nj=Object.keys(adhocJ).length;
+  toast("IOC+ matched "+nfmt(nm)+" MFT / "+nfmt(nj)+" $J embedded rows");
+  if(VIEW==="ov")renderOverview();else applyFilters();
+};
+
+// ---- export / case notes
+$("bCsv").onclick=function(){
+  if(VIEW==="ov"){toast("switch to Timeline or Files first");return}
+  var rows=activeRows(),c=cols(),i,j,r,line,out=[],hd=[];
+  var names=VIEW==="j"?DATA.cols.j:DATA.cols.mft;
+  out.push(names.join(","));
+  for(i=0;i<filtered.length;i++){r=rows[filtered[i]];line=[];
+    for(j=0;j<r.length;j++){var v=String(r[j]==null?"":r[j]);
+      line.push(/[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v)}
+    out.push(line.join(","))}
+  var blob=new Blob([out.join("\r\n")],{type:"text/csv"});
+  var a=document.createElement("a");a.href=URL.createObjectURL(blob);
+  a.download=meta.host+"-"+(VIEW==="j"?"USN":"MFT")+"-filtered.csv";a.click();
+  toast("exported "+nfmt(filtered.length)+" rows");
+};
+$("bNotes").onclick=function(){
+  var L=[],i,r;
+  L.push("MFT/USN triage - "+meta.host+" (generated "+meta.generated+", engine "+meta.appVersion+")");
+  L.push("Parsed "+nfmt(meta.mftTotal)+" $MFT rows / "+nfmt(meta.jTotal)+" $J rows; "+nfmt(meta.iocHits)+" IOC hits; "+nfmt(meta.mftStomp)+" SI<FN flagged; "+nfmt(meta.mftDeleted)+" deleted.");
+  L.push("Embedded "+nfmt(meta.mftKept)+"/"+nfmt(meta.jKept)+" (budget "+nfmt(meta.budget)+"). All times UTC.");
+  L.push("");
+  var idx=[];for(i=0;i<DATA.mft.length;i++)if(DATA.mft[i][M.SC]>=3)idx.push(i);
+  idx.sort(function(a,b){return DATA.mft[b][M.SC]-DATA.mft[a][M.SC]});
+  L.push("Top suspicious MFT records ("+nfmt(idx.length)+" at score >= 3):");
+  for(i=0;i<Math.min(idx.length,10);i++){r=DATA.mft[idx[i]];
+    L.push("  ["+r[M.SC]+"] "+r[M.CR10]+"  "+r[M.PP]+"\\"+r[M.FN]+"  ("+r[M.TAGS]+")")}
+  idx=[];for(i=0;i<DATA.j.length;i++)if(DATA.j[i][J.SC]>=2)idx.push(i);
+  idx.sort(function(a,b){return DATA.j[b][J.SC]-DATA.j[a][J.SC]});
+  L.push("Top suspicious USN events ("+nfmt(idx.length)+" at score >= 2):");
+  for(i=0;i<Math.min(idx.length,10);i++){r=DATA.j[idx[i]];
+    L.push("  ["+r[J.SC]+"] "+r[J.TS]+"  "+r[J.PP]+"\\"+r[J.NAME]+"  ("+r[J.UPD]+")")}
+  copyText(L.join("\n"));toast("case notes copied");
+};
+
+// ---- font size (zoom scales layout uniformly; virtualization math is unaffected)
+var ZOOM=1;
+$("bFm").onclick=function(){ZOOM=Math.max(0.7,Math.round((ZOOM-0.1)*10)/10);document.body.style.zoom=ZOOM;if(VIEW!=="ov"){sizeGrid();renderWindow(true)}};
+$("bFp").onclick=function(){ZOOM=Math.min(1.4,Math.round((ZOOM+0.1)*10)/10);document.body.style.zoom=ZOOM;if(VIEW!=="ov"){sizeGrid();renderWindow(true)}};
+
+// ---- boot
+setView("ov");
+[/SCRIPT]
+</body></html>
+'@
+
+# build the close-script tag by concatenation so the literal sequence never appears
+# in this PS1 source - lets the whole engine embed inside the HTA payload block unharmed
+$openTag = "<script>"; $closeTag = "<" + "/scr" + "ipt>"
+$html = $TEMPLATE.Replace("[SCRIPT]", $openTag).Replace("[/SCRIPT]", $closeTag)
+$html = $html.Replace("__TITLE__", ($safeHost + " - MFT/USN Triage Report"))
+$html = $html.Replace("/*__DATA__*/", $dataJs)
+
+$reportPath = Join-Path $OutDir ($safeHost + "-MFT-Report.html")
+[System.IO.File]::WriteAllText($reportPath, $html, (New-Object System.Text.UTF8Encoding($false)))
+
+Say ("Done in " + $sw.Elapsed.ToString("mm\:ss") + " - report " +
+     ("{0:N1}" -f ((Get-Item -LiteralPath $reportPath).Length / 1MB)) + " MB")
+Write-Output $reportPath
+exit 0
+# MFTECMD-ENGINE-END
+</script>
+
+<script language="JScript">
+"use strict";
+
+var APP_VERSION = "0.3.0-p3";
+var KNOWN_LATEST_MFTECMD = "1.2.2.1";                                             // baseline as of 2026-07-03 (installed KAPE build)
+var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
+var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
+var EXE = "", EXE_DIR = "", LOCAL_VER = "", LATEST_VER = "", WEB_OK = false;
+var BUSY = false;
+var LAST_REPORT = "";
+var ENGINE_PS1 = "";                 // resolved path of the extracted engine on disk
+
+/* ---------- tiny helpers ---------- */
+function $(id){ return document.getElementById(id); }
+function esc(s){ if(s==null) return ""; s=String(s);
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function trimStr(s){ return String(s).replace(/^\s+|\s+$/g,""); }
+function setStatus(msg,cls){ var el=$("status"); el.innerHTML=esc(msg); el.className=cls||"muted"; }
+function appendLog(t){ var el=$("log"); if(el.getAttribute("data-ph")==="1"){ el.innerHTML=""; el.setAttribute("data-ph","0"); }
+  el.style.display="block"; $("logToggle").innerHTML="Hide log"; el.innerHTML+=esc(t)+"\n"; el.scrollTop=el.scrollHeight; }
+function setLog(t){ var el=$("log"); el.setAttribute("data-ph","0"); el.style.display="block"; $("logToggle").innerHTML="Hide log";
+  el.innerHTML=esc(t); el.scrollTop=el.scrollHeight; }
+function uid(){ return new Date().getTime()+""+Math.floor(Math.random()*100000); }
+function fileExists(p){ try{ return new ActiveXObject("Scripting.FileSystemObject").FileExists(p); }catch(e){ return false; } }
+function folderExists(p){ try{ return new ActiveXObject("Scripting.FileSystemObject").FolderExists(p); }catch(e){ return false; } }
+function parentDir(p){ var i=String(p).lastIndexOf("\\"); return i>=0?p.substring(0,i):p; }
+function baseName(p){ if(!p) return ""; p=String(p); var i=Math.max(p.lastIndexOf("\\"),p.lastIndexOf("/")); return i>=0?p.substring(i+1):p; }
+/* cmd expands %VAR% inside .bat FILE lines even in quotes - double them there only */
+function batEsc(s){ return String(s).replace(/%/g,"%%"); }
+
+/* ---------- file IO with network-zone fallback (ADODB -> FSO), from the family ---------- */
+var FILE_IO="adodb";
+function zoneNote(){ appendLog("NOTE: running from a network location, so Windows zone policy blocks ADODB.Stream. Falling back to ANSI file IO for the small helper files (IOC list, log). The engine PS1 and report are unaffected. For full fidelity run from a LOCAL path."); }
+function writeText(path,text){
+  if(FILE_IO==="adodb"){
+    try{ var st=new ActiveXObject("ADODB.Stream"); st.Type=2; st.Charset="utf-8"; st.Open(); st.WriteText(text); st.SaveToFile(path,2); st.Close(); return; }
+    catch(e){ if(!/safety settings|data source/i.test(e.message||"")) throw e; FILE_IO="fso"; zoneNote(); }
+  }
+  var fso=new ActiveXObject("Scripting.FileSystemObject"); var f=fso.CreateTextFile(path,true,false); f.Write(text); f.Close();
+}
+function readText(path){
+  if(FILE_IO==="adodb"){
+    try{ var st=new ActiveXObject("ADODB.Stream"); st.Type=2; st.Charset="utf-8"; st.Open(); st.LoadFromFile(path);
+      var parts=[]; while(!st.EOS){ parts.push(st.ReadText(65536)); } st.Close(); return parts.join(""); }
+    catch(e){ if(!/safety settings|data source/i.test(e.message||"")) throw e; FILE_IO="fso"; zoneNote(); }
+  }
+  var fso=new ActiveXObject("Scripting.FileSystemObject"); var f=fso.OpenTextFile(path,1,false,0), out=f.ReadAll(); f.Close();
+  if(out.length>=3 && out.charCodeAt(0)===239 && out.charCodeAt(1)===187 && out.charCodeAt(2)===191) out=out.substring(3);
+  return out;
+}
+/* the PS1 payload is pure ASCII - write it with FSO (ANSI) which is exactly right and zone-immune */
+function writeAscii(path,text){ var fso=new ActiveXObject("Scripting.FileSystemObject"); var f=fso.CreateTextFile(path,true,false); f.Write(text); f.Close(); }
+
+/* ---------- async batch runner (family runBatAsync/pollDone) ---------- */
+function runBatAsync(lines, show){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var sh=new ActiveXObject("WScript.Shell");
+  var tmp=fso.GetSpecialFolder(2)+"";
+  var stamp=uid();
+  var bat=tmp+"\\mftw_"+stamp+".bat";
+  var logp=tmp+"\\mftw_"+stamp+".log";
+  var donep=tmp+"\\mftw_"+stamp+".done";
+  var f=fso.CreateTextFile(bat,true);
+  f.WriteLine("@echo off");
+  for(var i=0;i<lines.length;i++){ f.WriteLine(lines[i].replace(/__LOG__/g,logp)); }
+  f.WriteLine('echo done> "'+donep+'"');
+  f.Close();
+  sh.Run('cmd /c ""'+bat+'""', show?1:0, false);
+  return { bat:bat, log:logp, done:donep, elapsed:0 };
+}
+function runBatSync(lines, show){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var sh=new ActiveXObject("WScript.Shell");
+  var tmp=fso.GetSpecialFolder(2)+"", stamp=uid();
+  var bat=tmp+"\\mftw_"+stamp+".bat", logp=tmp+"\\mftw_"+stamp+".log";
+  var f=fso.CreateTextFile(bat,true); f.WriteLine("@echo off");
+  for(var i=0;i<lines.length;i++){ f.WriteLine(lines[i].replace(/__LOG__/g,logp)); }
+  f.Close();
+  var rc=sh.Run('cmd /c ""'+bat+'""', show?1:0, true);
+  var txt=""; try{ if(fso.FileExists(logp)) txt=readText(logp); }catch(e){ txt="(log unreadable: "+e.message+")"; }
+  try{ fso.DeleteFile(bat); }catch(e2){}
+  try{ if(fso.FileExists(logp)) fso.DeleteFile(logp); }catch(e3){}
+  return { rc:rc, log:txt };
+}
+function pollDone(ctx){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  // stream the growing log into the pane each tick
+  try{ if(fso.FileExists(ctx.log)) setLog(readText(ctx.log)); }catch(eLog){}
+  if(fso.FileExists(ctx.done)){
+    var log=""; try{ if(fso.FileExists(ctx.log)) log=readText(ctx.log); }catch(e){ log="(log unreadable: "+e.message+")"; }
+    try{ fso.DeleteFile(ctx.bat); }catch(e1){}
+    try{ fso.DeleteFile(ctx.done); }catch(e2){}
+    try{ if(fso.FileExists(ctx.log)) fso.DeleteFile(ctx.log); }catch(e3){}
+    ctx.onDone(log);
+    return;
+  }
+  ctx.elapsed+=1;
+  if(ctx.elapsed>2400){ ctx.onTimeout&&ctx.onTimeout(); return; }   // 40-min cap (MFT parse can be minutes)
+  if(ctx.onTick) ctx.onTick(ctx.elapsed);
+  window.setTimeout(function(){ pollDone(ctx); }, 1000);
+}
+
+/* ---------- app folder / payload extraction ---------- */
+function htaFolder(){
+  try{ var cl=mftHta.commandLine+""; var m=cl.match(/"([^"]+\.hta)"/i); if(!m) m=cl.match(/([A-Za-z]:\\[^"]+\.hta)/i);
+    if(m) return parentDir(m[1]); }catch(e){}
+  try{ var p=decodeURIComponent(location.pathname+"").replace(/^\//,"").replace(/\//g,"\\"); return parentDir(p); }catch(e2){}
+  return "";
+}
+function isNetworkPath(p){
+  try{ if(/^\\\\/.test(p)) return true;
+    var fso=new ActiveXObject("Scripting.FileSystemObject");
+    return fso.GetDrive(fso.GetDriveName(p)).DriveType===3; }catch(e){ return false; }
+}
+function payloadText(){
+  var el=$("ps1Payload"); var t=(el.text!=null?el.text:el.innerHTML)+"";
+  // strip a single leading newline introduced by the block formatting
+  t=t.replace(/^\r?\n/,"");
+  return t;
+}
+function payloadOK(t){ return t.indexOf("# MFTECMD-ENGINE-START")>=0 && t.indexOf("# MFTECMD-ENGINE-END")>=0; }
+/* extract the engine next to the .hta (overwrite always); fall back to %TEMP% on a read-only share */
+function extractEngine(){
+  var t=payloadText();
+  if(!payloadOK(t)){ setStatus("Embedded engine payload is missing or corrupt (self-check failed). Re-splice MFTECmd-Engine.ps1 into this .hta.","err"); return ""; }
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var dir=htaFolder(), targets=[];
+  if(dir) targets.push(dir+"\\MFTECmd-Engine.ps1");
+  targets.push(fso.GetSpecialFolder(2)+"\\MFTECmd-Engine.ps1");
+  for(var i=0;i<targets.length;i++){
+    try{ writeAscii(targets[i], t);
+      // verify round-trip
+      var back=readText(targets[i]);
+      if(payloadOK(back)){ if(i>0) appendLog("App folder not writable - engine extracted to TEMP: "+targets[i]); return targets[i]; }
+    }catch(e){ /* try next target */ }
+  }
+  setStatus("Could not write the engine PS1 to the app folder or TEMP.","err");
+  return "";
+}
+
+/* ---------- MFTECmd discovery / version / download ---------- */
+function resolveExe(){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var dir=htaFolder(), cands=[];
+  if(dir) cands.push(dir+"\\MFTECmd.exe");
+  cands.push("C:\\Users\\Forensics\\Downloads\\1-Package\\KAPE\\Modules\\bin\\MFTECmd.exe");   // known install on this box
+  cands.push("C:\\ZimmermanTools\\net9\\MFTECmd.exe");
+  cands.push("C:\\ZimmermanTools\\MFTECmd.exe");
+  cands.push("C:\\Tools\\net9\\MFTECmd.exe");
+  for(var i=0;i<cands.length;i++){ if(fso.FileExists(cands[i])){ EXE=cands[i]; EXE_DIR=parentDir(cands[i]); return true; } }
+  EXE=""; EXE_DIR=dir||""; return false;
+}
+function verTuple(v){ var p=String(v).split("."); var a=[]; for(var i=0;i<p.length;i++) a.push(parseInt(p[i],10)||0); return a; }
+function verCmp(a,b){ a=verTuple(a); b=verTuple(b); var n=Math.max(a.length,b.length);
+  for(var i=0;i<n;i++){ var x=a[i]||0,y=b[i]||0; if(x!==y) return x<y?-1:1; } return 0; }
+function fetchLatest(){
+  LATEST_VER=KNOWN_LATEST_MFTECMD; WEB_OK=false;
+  try{ var x=new ActiveXObject("MSXML2.ServerXMLHTTP.6.0"); x.setTimeouts(2000,3000,4000,4000);
+    x.open("GET", MFTECMD_PAGE, false); x.send();
+    if(x.status===200){ WEB_OK=true; var t=x.responseText+""; var m=t.match(/MFTECmd[\s\S]{0,800}?(\d+\.\d+\.\d+\.\d+)/i); if(m) LATEST_VER=m[1]; }
+  }catch(e){ WEB_OK=false; }
+  return LATEST_VER;
+}
+function updateVerPill(){
+  var s=LOCAL_VER?("MFTECmd v"+esc(LOCAL_VER)):"MFTECmd: not found";
+  if(!WEB_OK){ s+=" &middot; <span style='color:#8b949e'>no web check</span>"; }
+  else if(LATEST_VER){
+    if(LOCAL_VER && verCmp(LOCAL_VER,LATEST_VER)<0) s+=" &middot; <span style='color:#d29922'>v"+esc(LATEST_VER)+" available</span>";
+    else if(LOCAL_VER) s+=" &middot; <span style='color:#3fb950'>latest</span>";
+    else s+=" &middot; latest v"+esc(LATEST_VER);
+  }
+  $("verpill").innerHTML=s;
+}
+function checkVersion(){
+  if(!EXE || !fileExists(EXE)){ LOCAL_VER=""; updateVerPill(); setStatus("MFTECmd.exe not found - use 'Update / download MFTECmd'","err"); return; }
+  try{
+    var r=runBatSync(["set DOTNET_ROLL_FORWARD=Major", '"'+batEsc(EXE)+'" --version > "__LOG__" 2>&1']);
+    var m=r.log.match(/MFTECmd version ([0-9.]+)/i);
+    if(!m) m=r.log.match(/(\d+\.\d+\.\d+\.\d+)/);
+    if(m){ LOCAL_VER=m[1]; updateVerPill(); setStatus("MFTECmd v"+LOCAL_VER+" detected","ok"); }
+    else { LOCAL_VER=""; updateVerPill(); setStatus("Ran MFTECmd but could not parse version - see log","err"); appendLog(r.log); }
+  }catch(e){ LOCAL_VER=""; updateVerPill(); setStatus("Version check failed: "+e.message,"err"); }
+}
+function evaluateTooling(){
+  var dir=htaFolder();
+  var found=resolveExe();
+  if(EXE) $("exeline").innerHTML="MFTECmd: "+esc(EXE)+"  &middot;  run with DOTNET_ROLL_FORWARD=Major";
+  else $("exeline").innerHTML='<span class="err">MFTECmd.exe not found next to this app or in the known locations - use Update / download</span>';
+  if(found) checkVersion(); else LOCAL_VER="";
+  fetchLatest(); updateVerPill();
+}
+function downloadLatest(){
+  var target=htaFolder()||EXE_DIR;
+  if(!target){ setStatus("Cannot determine the app folder to install into","err"); return; }
+  if(!confirm("Download MFTECmd (.NET 9 build) from:\n"+MFTECMD_ZIP_URL+"\n\nInstall next to this app into:\n"+target+"\n\nProceed?")) return;
+  setStatus("Downloading & installing MFTECmd…","muted");
+  var tq=String(target).replace(/'/g,"''");
+  var ps="$ErrorActionPreference='Stop';"
+    +"[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;"
+    +"$u='"+MFTECMD_ZIP_URL+"';"
+    +"$z=Join-Path $env:TEMP 'MFTECmd_dl.zip';"
+    +"$x=Join-Path $env:TEMP ('MFTECmd_x_'+[guid]::NewGuid().ToString('N'));"
+    +"Invoke-WebRequest -Uri $u -OutFile $z;"
+    +"Expand-Archive -Force -Path $z -DestinationPath $x;"
+    +"$exe=Get-ChildItem -Path $x -Recurse -Filter MFTECmd.exe | Select-Object -First 1;"
+    +"if(-not $exe){throw 'MFTECmd.exe not found in downloaded archive'};"
+    +"$src=Split-Path $exe.FullName;"
+    +"New-Item -ItemType Directory -Force -Path '"+tq+"' | Out-Null;"
+    +"Copy-Item -Path (Join-Path $src '*') -Destination '"+tq+"' -Recurse -Force;"
+    +"Remove-Item $z,$x -Recurse -Force -ErrorAction SilentlyContinue;"
+    +"Write-Output 'INSTALL_OK'";
+  try{
+    var r=runBatSync(['powershell -NoProfile -ExecutionPolicy Bypass -Command "'+ps+'" > "__LOG__" 2>&1']);
+    appendLog("--- MFTECmd download / install ---\n"+r.log);
+    if((r.log+"").indexOf("INSTALL_OK")>=0){ setStatus("MFTECmd installed to "+target,"ok"); evaluateTooling(); }
+    else setStatus("Download/install failed - see log","err");
+  }catch(e){ setStatus("Download failed: "+e.message,"err"); }
+}
+
+/* ---------- input guessing ---------- */
+/* given a chosen $MFT, look for a sibling $J in the same NTFS root (Velociraptor layout) */
+function guessJ(mft){
+  if(!mft) return "";
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var root=parentDir(mft);
+  var cands=[
+    root+"\\$Extend\\$UsnJrnl%3A$J",
+    root+"\\$Extend\\$UsnJrnl$J",
+    root+"\\$Extend\\$J",
+    root+"\\$J"
+  ];
+  for(var i=0;i<cands.length;i++){ try{ if(fso.FileExists(cands[i])) return cands[i]; }catch(e){} }
+  return "";
+}
+/* pull a hostname-ish token out of a Velociraptor collection path */
+function guessHost(p){
+  if(!p) return "";
+  var m=String(p).match(/Collection-([A-Za-z0-9][A-Za-z0-9\-_]+?)-\d{4}-\d{2}-\d{2}/);
+  if(m) return m[1];
+  return "";
+}
+/* recursively find $MFT under a collection root (bounded) */
+var MFT_MAX=12, MFT_DEPTH_MAX=24, MFT_SCAN_MAX=40000, MFT_DIRS=0;
+function findMfts(root){
+  var fso=new ActiveXObject("Scripting.FileSystemObject"), out=[]; MFT_DIRS=0;
+  function walk(fld,depth){
+    if(out.length>=MFT_MAX||depth>MFT_DEPTH_MAX||MFT_DIRS>=MFT_SCAN_MAX) return;
+    MFT_DIRS++;
+    try{ var fe=new Enumerator(fld.Files);
+      for(;!fe.atEnd();fe.moveNext()){ var f=fe.item();
+        if(String(f.Name).toUpperCase()==="$MFT"){ out.push(f.Path+""); if(out.length>=MFT_MAX) return; } } }catch(e1){}
+    try{ var de=new Enumerator(fld.SubFolders);
+      for(;!de.atEnd();de.moveNext()){ walk(de.item(),depth+1); if(out.length>=MFT_MAX) return; } }catch(e2){}
+  }
+  try{ walk(fso.GetFolder(root),0); }catch(e){}
+  return out;
+}
+
+/* ---------- the run ---------- */
+function processRun(){
+  if(BUSY){ setStatus("A run is already in progress.","err"); return; }
+  var mft=trimStr($("mftPath").value);
+  if(!mft || !fileExists(mft)){ setStatus("Pick a valid $MFT file first.","err"); return; }
+  var j=trimStr($("jPath").value);
+  if(j && !fileExists(j)){ setStatus("The $J path is set but does not exist - clear it or fix it.","err"); return; }
+  if(!EXE || !fileExists(EXE)){ setStatus("MFTECmd.exe not found - use 'Update / download MFTECmd'.","err"); return; }
+
+  var outDir=trimStr($("outDir").value);
+  if(!outDir){ setStatus("Set an output folder.","err"); return; }
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  try{ if(!fso.FolderExists(outDir)) fso.CreateFolder(outDir); }catch(e){ setStatus("Cannot create output folder: "+e.message,"err"); return; }
+
+  ENGINE_PS1=extractEngine();
+  if(!ENGINE_PS1) return;
+
+  var host=trimStr($("hostLabel").value)||guessHost(mft)||"HOST";
+  var budget=$("rowBudget").value;
+  var wf=trimStr($("winFrom").value), wt=trimStr($("winTo").value);
+
+  // IOC list -> temp file (avoids command-line quoting/length limits)
+  var iocFile="";
+  var iocs=trimStr($("iocBox").value);
+  if(iocs){ iocFile=fso.GetSpecialFolder(2)+"\\mft_iocs_"+uid()+".txt"; try{ writeText(iocFile, iocs); }catch(e2){ appendLog("Could not write IOC temp file: "+e2.message); iocFile=""; } }
+
+  // build the PS invocation. Engine args are passed as -File params (single-% paths).
+  var q=function(s){ return '"'+String(s).replace(/"/g,'\\"')+'"'; };
+  var psArgs="-NoProfile -ExecutionPolicy Bypass -File "+q(ENGINE_PS1)
+    +" -Mft "+q(mft)
+    +(j?(" -J "+q(j)):"")
+    +" -OutDir "+q(outDir)
+    +" -HostLabel "+q(host)
+    +(iocFile?(" -IocFile "+q(iocFile)):"")
+    +" -RowBudget "+budget
+    +(wf?(" -From "+q(wf)):"")
+    +(wt?(" -To "+q(wt)):"")
+    +" -AppVersion "+q(APP_VERSION)
+    +" -MftecmdPath "+q(EXE);
+
+  BUSY=true; $("runBtn").disabled=true; $("viewBtn").disabled=true;
+  setStatus("Running MFTECmd + engine… a console window shows live progress.","muted");
+  appendLog("=== MFTECmd Wrapper run "+(new Date())+" ===");
+  appendLog("engine: "+ENGINE_PS1);
+  appendLog("host="+host+"  budget="+budget+"  $J="+(j?"yes":"no")+"  iocs="+(iocFile?"yes":"none"));
+
+  // batEsc only the wrapping .bat line (the powershell command line itself is a bat line)
+  var ctx=runBatAsync([ "powershell "+batEsc(psArgs)+" > \"__LOG__\" 2>&1" ], true);
+  ctx.onTick=function(s){ setStatus("Working… "+s+"s (MFT parse is the slow part; large volumes take a few minutes)","muted"); };
+  ctx.onTimeout=function(){ BUSY=false; $("runBtn").disabled=false; setStatus("Engine still running after 40 min - check the console window.","err"); };
+  ctx.onDone=function(lg){
+    BUSY=false; $("runBtn").disabled=false;
+    // engine prints the report path on the LAST non-empty line on success
+    var rep=""; var lines=(lg+"").replace(/\r/g,"").split("\n");
+    for(var i=lines.length-1;i>=0;i--){ var ln=trimStr(lines[i]); if(ln){ rep=ln; break; } }
+    if(/ERROR:/.test(lg) || !/\.html$/i.test(rep) || !fileExists(rep)){
+      setStatus("Run failed or no report produced - see log.","err");
+      appendLog("--- last engine output ---\n"+tailLines(lg,30));
+      return;
+    }
+    LAST_REPORT=rep; $("viewBtn").disabled=false;
+    if(iocFile){ try{ fso.DeleteFile(iocFile); }catch(e3){} }
+    setStatus("Report ready: "+rep,"ok");
+    appendLog("Report: "+rep);
+    openReport(rep);
+  };
+}
+function tailLines(s,n){ var a=(s+"").replace(/\r/g,"").split("\n"); if(a.length<=n) return s; return a.slice(a.length-n).join("\n"); }
+
+/* open the report in Edge; fall back to the default browser */
+function openReport(rep){
+  var sh=new ActiveXObject("WScript.Shell");
+  try{ sh.Run('msedge.exe "'+rep+'"', 1, false); return; }catch(e){}
+  try{ sh.Run('cmd /c start "" "msedge.exe" "'+rep+'"', 0, false); return; }catch(e2){}
+  try{ sh.Run('"'+rep+'"', 1, false); }catch(e3){ setStatus("Could not open the report automatically: "+rep,"err"); }
+}
+
+/* ---------- browse dialogs ---------- */
+function browseFolder(prompt){
+  try{ var sha=new ActiveXObject("Shell.Application");
+    var fld=sha.BrowseForFolder(0, prompt, 0x51);
+    if(fld){ var p=""; try{ p=fld.Self.Path+""; }catch(e2){}
+      if(/^[a-z]:\\|^\\\\/i.test(p)) return p; } }catch(e){}
+  return "";
+}
+
+/* ---------- init / wireup ---------- */
+function init(){
+  try{ window.resizeTo(1000,820); }catch(e){}
+  $("appver").innerHTML="&middot; v"+APP_VERSION;
+  try{ document.title="MFTECmd Wrapper v"+APP_VERSION; }catch(e){}
+
+  // startup self-check on the payload
+  var pt=payloadText();
+  if(!payloadOK(pt)){ setStatus("WARNING: embedded engine payload failed its self-check - re-splice MFTECmd-Engine.ps1 before running.","err"); }
+  else { $("modepill").innerHTML="engine embedded ("+Math.round(pt.length/1024)+" KB)"; }
+
+  // default output folder next to the .hta
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var base=htaFolder()||fso.GetSpecialFolder(2)+"";
+  var outDir=base+"\\MFT Reports";
+  try{ if(!fso.FolderExists(outDir)) fso.CreateFolder(outDir); }catch(e){}
+  $("outDir").value=outDir;
+
+  var zoom=0.9;
+  $("fup").onclick=function(){ zoom=Math.min(zoom+0.1,2.6); document.body.style.zoom=zoom; };
+  $("fdown").onclick=function(){ zoom=Math.max(zoom-0.1,0.5); document.body.style.zoom=zoom; };
+
+  // hidden native file pickers
+  $("mftBrowse").onclick=function(){ $("mftPick").click(); };
+  $("mftPick").onchange=function(){ if(this.value){ $("mftPath").value=this.value;
+    var g=guessJ(this.value); if(g && !trimStr($("jPath").value)){ $("jPath").value=g; setStatus("Found a sibling $J and filled it in.","ok"); }
+    var h=guessHost(this.value); if(h && !trimStr($("hostLabel").value)) $("hostLabel").value=h; } };
+  $("jBrowse").onclick=function(){ $("jPick").click(); };
+  $("jPick").onchange=function(){ if(this.value) $("jPath").value=this.value; };
+  $("jClear").onclick=function(){ $("jPath").value=""; };
+
+  $("mftDirBrowse").onclick=function(){
+    var p=browseFolder("Select a collection folder - it is searched recursively for $MFT.");
+    if(!p){ setStatus("No folder chosen (or it has no filesystem path).","muted"); return; }
+    setStatus("Searching "+p+" for $MFT…","muted");
+    window.setTimeout(function(){
+      var hits=findMfts(p);
+      if(!hits.length){ setStatus("No $MFT found under "+p,"err"); return; }
+      // prefer the largest (the system volume); fill the first, report count
+      $("mftPath").value=hits[0];
+      var g=guessJ(hits[0]); if(g) $("jPath").value=g;
+      var h=guessHost(hits[0]); if(h) $("hostLabel").value=h;
+      setStatus("Found "+hits.length+" $MFT - using "+hits[0]+(hits.length>1?" (edit the path if you meant another)":""),"ok");
+    },30);
+  };
+
+  $("iocLoad").onclick=function(){ $("iocPick").click(); };
+  $("iocPick").onchange=function(){ if(this.value){ try{ $("iocBox").value=readText(this.value); }catch(e){ setStatus("Could not read IOC file: "+e.message,"err"); } } };
+
+  $("outBrowse").onclick=function(){ var p=browseFolder("Select an output folder for the report and CSVs."); if(p) $("outDir").value=p; };
+  $("outOpen").onclick=function(){ var d=trimStr($("outDir").value); if(d && folderExists(d)){ try{ new ActiveXObject("WScript.Shell").Run('explorer.exe "'+d+'"',1,false); }catch(e){} } };
+
+  $("runBtn").onclick=processRun;
+  $("viewBtn").onclick=function(){ if(LAST_REPORT && fileExists(LAST_REPORT)) openReport(LAST_REPORT); };
+  $("verBtn").onclick=checkVersion;
+  $("updBtn").onclick=downloadLatest;
+  $("logToggle").onclick=function(){ var l=$("log");
+    if(l.style.display==="none"||!l.style.display){ l.style.display="block"; this.innerHTML="Hide log"; }
+    else { l.style.display="none"; this.innerHTML="Show log"; } };
+
+  evaluateTooling();
+  if(isNetworkPath(htaFolder()))
+    appendLog("Heads-up: running from a network location ("+htaFolder()+"). The engine extracts locally-first then falls back to %TEMP%; small helper-file IO falls back to ANSI automatically.");
+}
+window.onload=init;
+</script>
+
+<input type="file" id="mftPick" class="hide">
+<input type="file" id="jPick" class="hide">
+<input type="file" id="iocPick" class="hide">
+
+</body>
+</html>

@@ -1,0 +1,14 @@
+# never publish case data or tool binaries
+*.csv
+MFT Reports/
+MFT-Report.html
+*-MFT-Report.html
+csv/
+*.log
+MFTECmd.exe
+MFTECmd.dll
+MFTECmd.runtimeconfig.json
+MFTECmd-Engine.ps1
+*.zip
+$MFT
+$J
