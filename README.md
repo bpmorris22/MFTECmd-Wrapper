@@ -6,6 +6,10 @@ One `.hta` file, no install and no dependencies: it runs MFTECmd for you, scores
 
 Sibling of [PECmd-Wrapper](https://github.com/bpmorris22/PECmd-Wrapper), [SrumECmd-Wrapper](https://github.com/bpmorris22/SrumECmd-Wrapper), [AmcacheParser-Wrapper](https://github.com/bpmorris22/AmcacheParser-Wrapper) and [SQLECmd-Wrapper](https://github.com/bpmorris22/SQLECmd-Wrapper) — same look, deliberately complementary artifact. Prefetch/Amcache tell you *what ran*; SRUM tells you *what talked*; the `$MFT`/`$J` tell you **what appeared, changed, and was deleted, and exactly when** — the staging, timestomping, and create-then-delete story the execution artifacts can't show. It is also the one artifact that still has evidence when a SYSTEM boot-service RAT leaves no per-executable prefetch.
 
+The single-file launcher:
+
+![The MFTECmd Wrapper launcher](images/launcher.jpg)
+
 ## Why this one is a hybrid (and not pure-HTA like its siblings)
 
 The other wrappers hold their whole dataset inside the `.hta` and render it in `mshta.exe`. That works for hundreds or thousands of rows. An `$MFT` is routinely **0.5–3 million rows** and a `$J` similar — far past what mshta's ES5 engine can load or render. So this tool splits the work:
@@ -24,6 +28,22 @@ The launcher is a form only — it never loads row data, so mshta stays fast. Th
 ## The reduction banner (read this)
 
 A report embeds a **budget** of the highest-priority rows per artifact (default 100,000 each), not all of them. The banner at the top of every report states exactly what was kept vs. parsed, e.g. *"Showing 100,000 of 1,490,697 $MFT rows…"*. Rows are kept in priority order — **IOC hits are never dropped**, then by score, then in-window rows, then newest-first — and the full CSVs always remain on disk in `.\csv\` for Timeline Explorer. Nothing is silently truncated; the counts are always on screen.
+
+## The report
+
+The report opens in Edge with an **Overview** (headline stats, a clickable per-day `$J` histogram, and a top-suspicious / busiest-dirs / newest-executables dashboard):
+
+![Report overview](images/demo-overview.png)
+
+A virtualized, scored **Files ($MFT)** grid — filter and sort a hundred thousand rows with no lag; suspicious rows shade red, every tag carries its reasoning, and clicking a row opens a detail pane with both `0x10`/`0x30` timestamps and the cross-linked `$J` events:
+
+![Files view](images/demo-files.png)
+
+And a **Timeline ($J)** view of USN events — file-creation bursts, create-then-delete staging, and IOC hits surfaced first:
+
+![Timeline view](images/demo-timeline.png)
+
+*(Screenshots are from a synthetic demo dataset — a fake `DEMO-WKSTN` host with a made-up node-based staging scenario — not real case data.)*
 
 ## Features
 
