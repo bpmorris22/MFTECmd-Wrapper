@@ -110,6 +110,8 @@ mshta.exe "MFTECmd-Wrapper.hta" "<inputOrReport>" ["<outDir>"] [/auto]
 - `<input>` — a `$MFT` file / collection directory (prefilled; the report is built if `/auto`), or an existing `.html` report to re-open.
 - `<outDir>` — output directory for the report and CSVs (optional; defaults to `_Processed\<host>\MFTECmd` next to the app).
 - **Target hostname** is required before processing — it names the report file and the `_Processed\<host>\MFTECmd` output folder next to the app (family convention shared with the DFIR-Artifact-Finder). Guessed from `Collection-<host>-…` paths, a passed `_Processed\<host>\` outDir, or this machine's name for live paths — overwrite the guess if it's wrong.
+- **Shared IOC list** — if no IOC terms are given, an `IOC.txt` next to the app is passed to the engine automatically (one term per line, `#` comments); one list covers the whole toolkit.
+- **Run provenance** — every successful run appends a `runinfo.json` entry (app, host, $MFT path, report name) in the output folder; the DFIR-Artifact-Finder uses it to show processed state even for standalone runs.
 - `/auto` — build the report immediately.
 
 ## Credits

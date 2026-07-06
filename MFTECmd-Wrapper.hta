@@ -1531,7 +1531,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.3.0";
+var APP_VERSION = "1.4.0";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1851,6 +1851,24 @@ function requireHost(){
   return h;
 }
 
+/* ---------- run provenance (family, 2026-07-06) ----------
+   Appended into <outDir>\runinfo.json after every successful run. The Artifact-Finder reads
+   these to bind outputs to their exact source artifact (and host) even without its manifest —
+   standalone wrapper runs show up as processed too. */
+function writeRunInfo(outdir, input, freshFiles){
+  try{
+    var p=String(outdir).replace(/[\\\/]+$/,"")+"\\runinfo.json";
+    var arr=[];
+    try{ if(fileExists(p)){ var old=JSON.parse(readText(p)); if(old && old.length!=null) arr=old; } }catch(e0){}
+    var d=new Date(); function p2(x){ return (x<10?"0":"")+x; }
+    var iso=d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+"T"+p2(d.getHours())+":"+p2(d.getMinutes())+":"+p2(d.getSeconds());
+    var names=[]; for(var i=0;i<freshFiles.length && i<50;i++) names.push(freshFiles[i].name||String(freshFiles[i]));
+    arr.push({app:APP_NAME, appVersion:APP_VERSION, host:sanitHost($("hostLabel").value),
+              input:String(input||""), finishedUtc:iso, files:names});
+    writeText(p, JSON.stringify(arr,null,2));
+  }catch(e){}
+}
+
 /* ---------- the run ---------- */
 function processRun(){
   if(BUSY){ setStatus("A run is already in progress.","err"); return; }
@@ -1880,9 +1898,16 @@ function processRun(){
   try{ if(fso.FileExists(expectedReport)) fso.DeleteFile(expectedReport); }catch(eDel){}
 
   // IOC list -> temp file (avoids command-line quoting/length limits)
-  var iocFile="";
+  var iocFile="", iocTemp=false;
   var iocs=trimStr($("iocBox").value);
-  if(iocs){ iocFile=fso.GetSpecialFolder(2)+"\\mft_iocs_"+uid()+".txt"; try{ writeText(iocFile, iocs); }catch(e2){ appendLog("Could not write IOC temp file: "+e2.message); iocFile=""; } }
+  if(iocs){ iocFile=fso.GetSpecialFolder(2)+"\\mft_iocs_"+uid()+".txt"; try{ writeText(iocFile, iocs); iocTemp=true; }catch(e2){ appendLog("Could not write IOC temp file: "+e2.message); iocFile=""; } }
+  // shared toolkit IOC list, family convention 2026-07-06: if no IOC terms were provided,
+  // an IOC.txt next to this app is passed straight to the engine (one term per line,
+  // # comments — the engine reads that format natively). User-provided IOCs always win.
+  if(!iocs && !iocFile){
+    var tkBase=htaFolder();
+    if(tkBase && fileExists(tkBase+"\\IOC.txt")){ iocFile=tkBase+"\\IOC.txt"; appendLog("Using toolkit IOC list: "+iocFile); }
+  }
 
   // build the PS invocation. Engine args are passed as -File params (single-% paths).
   var q=function(s){ return '"'+String(s).replace(/"/g,'\\"')+'"'; };
@@ -1922,7 +1947,8 @@ function processRun(){
     }
     if(mode==="stable") appendLog("(completion detected from the finished report file; the temp done-marker was not seen - harmless.)");
     LAST_REPORT=rep; $("viewBtn").disabled=false;
-    if(iocFile){ try{ fso.DeleteFile(iocFile); }catch(e3){} }
+    if(iocFile && iocTemp){ try{ fso.DeleteFile(iocFile); }catch(e3){} }   // never delete the shared toolkit IOC.txt
+    writeRunInfo(outDir, mft, [baseName(rep)]);
     setStatus("Report ready: "+rep,"ok");
     appendLog("Report: "+rep);
     openReport(rep);
@@ -2146,6 +2172,8 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
       <li><code>&lt;input&gt;</code> — a <code>$MFT</code> file / collection directory (prefilled; report built with <code>/auto</code>), or an existing <code>.html</code> report to re-open.</li>
       <li><code>&lt;outDir&gt;</code> — output directory for the report &amp; CSVs (optional). &nbsp; <code>/auto</code> — build immediately.</li>
       <li><b>Target hostname</b> is required before processing — it names the output folder <code>_Processed\&lt;host&gt;\MFTECmd</code> next to this app and the <code>&lt;host&gt;-MFT-Report.html</code> filename (family convention shared with the Artifact-Finder). Guessed from <code>Collection-&lt;host&gt;-…</code> paths, a passed <code>_Processed\&lt;host&gt;\</code> outDir, or this machine's name for live paths — overwrite the guess if it's wrong.</li>
+      <li><b>Shared IOC list</b>: if no IOC file is chosen, an <code>IOC.txt</code> next to this app is used automatically (one term per line, <code>#</code> comments) — one list covers the whole toolkit.</li>
+      <li>After every successful run a <code>runinfo.json</code> provenance entry (app, host, input path, report name) is appended in the output folder — the Artifact-Finder uses it to show processed state even for runs done outside the finder.</li>
     </ul>
     <h3>Notes</h3>
     <ul>
