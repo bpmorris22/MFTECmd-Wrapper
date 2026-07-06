@@ -118,7 +118,7 @@
     <h3>Options</h3>
     <div class="row">
       <span class="grid2">
-        <label class="fld">Host label (report name + header)</label>
+        <label class="fld" title="Required before processing. Guessed from the input path (Collection-&lt;host&gt;-&hellip; segments, or this machine for live paths) &mdash; overwrite it if the guess is wrong.">Target hostname (required) &mdash; names the report and the output folder _Processed\&lt;host&gt;\MFTECmd next to this app</label>
         <input class="txt mono" style="width:80%" id="hostLabel" placeholder="auto-detected from collection folder">
       </span>
       <span class="grid2">
@@ -1531,7 +1531,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.2.0";
+var APP_VERSION = "1.3.0";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1789,11 +1789,14 @@ function guessJ(mft){
   for(var i=0;i<cands.length;i++){ try{ if(fso.FileExists(cands[i])) return cands[i]; }catch(e){} }
   return "";
 }
-/* pull a hostname-ish token out of a Velociraptor collection path */
+/* pull a hostname-ish token out of a Velociraptor collection path, a _Processed\<host>\ path,
+   or fall back to this machine's name for live-system paths (C:\Windows, C:\Users) */
 function guessHost(p){
   if(!p) return "";
   var m=String(p).match(/Collection-([A-Za-z0-9][A-Za-z0-9\-_]+?)-\d{4}-\d{2}-\d{2}/);
   if(m) return m[1];
+  m=String(p).match(/[\\\/]_Processed[\\\/]([^\\\/]+)[\\\/]/i); if(m) return m[1];
+  if(/^[a-z]:\\(windows|users)(\\|$)/i.test(String(p))){ try{ return new ActiveXObject("WScript.Network").ComputerName+""; }catch(e){} }
   return "";
 }
 /* recursively find $MFT under a collection root (bounded) */
@@ -1813,6 +1816,41 @@ function findMfts(root){
   return out;
 }
 
+/* ---------- target hostname + _Processed output convention (family, 2026-07-06) ----------
+   All processed output lands in <appFolder>\_Processed\<Hostname>\MFTECmd\ so the
+   Artifact-Finder (and the operator) can see per-host state at a glance. The hostname field is
+   REQUIRED before processing (not for re-opening reports). User-typed values are never overwritten. */
+var APP_NAME="MFTECmd";
+var HOST_TOUCHED=false, OUT_TOUCHED=false;
+function sanitHost(s){ return String(s).replace(/[^A-Za-z0-9._\-]/g,"-").replace(/^[\-.]+|[\-.]+$/g,""); }
+function defaultOutDir(){
+  var h=sanitHost($("hostLabel").value); if(!h) return "";
+  var base=htaFolder(); if(!base){ try{ base=new ActiveXObject("Scripting.FileSystemObject").GetSpecialFolder(2)+""; }catch(e){ return ""; } }
+  return base+"\\_Processed\\"+h+"\\"+APP_NAME;
+}
+function syncOutDir(){ if(OUT_TOUCHED) return; var d=defaultOutDir(); if(d) $("outDir").value=d; }
+/* recursive mkdir - FSO CreateFolder is single-level and _Processed\<host>\MFTECmd is three deep */
+function ensureDir(p){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  p=String(p).replace(/[\\\/]+$/,"");
+  if(!p) return false;
+  if(fso.FolderExists(p)) return true;
+  var i=p.lastIndexOf("\\");
+  if(i>2){ var parent=p.substring(0,i); if(!fso.FolderExists(parent) && !ensureDir(parent)) return false; }
+  try{ fso.CreateFolder(p); return true; }catch(e){ return false; }
+}
+function hostGuessFrom(p){
+  if(!HOST_TOUCHED || !trimStr($("hostLabel").value)){ var g=guessHost(p); if(g) $("hostLabel").value=sanitHost(g); }
+  syncOutDir();
+}
+function requireHost(){
+  var h=sanitHost($("hostLabel").value);
+  if(!h){ setStatus("Target hostname is required — it names the output folder _Processed\\<host>\\"+APP_NAME+" and the report filename. Type the host this $MFT came from, then process again.","err");
+    try{ $("hostLabel").focus(); }catch(e){} return ""; }
+  if(!trimStr($("outDir").value)) syncOutDir();
+  return h;
+}
+
 /* ---------- the run ---------- */
 function processRun(){
   if(BUSY){ setStatus("A run is already in progress.","err"); return; }
@@ -1822,15 +1860,15 @@ function processRun(){
   if(j && !fileExists(j)){ setStatus("The $J path is set but does not exist - clear it or fix it.","err"); return; }
   if(!EXE || !fileExists(EXE)){ setStatus("MFTECmd.exe not found - use 'Update / download MFTECmd'.","err"); return; }
 
+  var host=requireHost(); if(!host) return;
   var outDir=trimStr($("outDir").value);
   if(!outDir){ setStatus("Set an output folder.","err"); return; }
   var fso=new ActiveXObject("Scripting.FileSystemObject");
-  try{ if(!fso.FolderExists(outDir)) fso.CreateFolder(outDir); }catch(e){ setStatus("Cannot create output folder: "+e.message,"err"); return; }
+  if(!ensureDir(outDir)){ setStatus("Cannot create output folder: "+outDir,"err"); return; }
 
   ENGINE_PS1=extractEngine();
   if(!ENGINE_PS1) return;
 
-  var host=trimStr($("hostLabel").value)||guessHost(mft)||"HOST";
   var budget=$("rowBudget").value;
   var wf=trimStr($("winFrom").value), wt=trimStr($("winTo").value);
 
@@ -1926,12 +1964,9 @@ function init(){
   if(!payloadOK(pt)){ setStatus("WARNING: embedded engine payload failed its self-check - re-splice MFTECmd-Engine.ps1 before running.","err"); }
   else { $("modepill").innerHTML="engine embedded ("+Math.round(pt.length/1024)+" KB)"; }
 
-  // default output folder next to the .hta
-  var fso=new ActiveXObject("Scripting.FileSystemObject");
-  var base=htaFolder()||fso.GetSpecialFolder(2)+"";
-  var outDir=base+"\\MFT Reports";
-  try{ if(!fso.FolderExists(outDir)) fso.CreateFolder(outDir); }catch(e){}
-  $("outDir").value=outDir;
+  // default output follows the target hostname: _Processed\<host>\MFTECmd next to the .hta
+  $("hostLabel").onkeyup=function(){ HOST_TOUCHED=true; syncOutDir(); };
+  $("outDir").onkeyup=function(){ OUT_TOUCHED=true; };
 
   var zoom=0.9;
   var zContent=$("content");
@@ -1945,7 +1980,7 @@ function init(){
   $("mftBrowse").onclick=function(){ $("mftPick").click(); };
   $("mftPick").onchange=function(){ if(this.value){ $("mftPath").value=this.value;
     var g=guessJ(this.value); if(g && !trimStr($("jPath").value)){ $("jPath").value=g; setStatus("Found a sibling $J and filled it in.","ok"); }
-    var h=guessHost(this.value); if(h && !trimStr($("hostLabel").value)) $("hostLabel").value=h; } };
+    hostGuessFrom(this.value); } };
   $("jBrowse").onclick=function(){ $("jPick").click(); };
   $("jPick").onchange=function(){ if(this.value) $("jPath").value=this.value; };
   $("jClear").onclick=function(){ $("jPath").value=""; };
@@ -1960,7 +1995,7 @@ function init(){
       // prefer the largest (the system volume); fill the first, report count
       $("mftPath").value=hits[0];
       var g=guessJ(hits[0]); if(g) $("jPath").value=g;
-      var h=guessHost(hits[0]); if(h) $("hostLabel").value=h;
+      hostGuessFrom(hits[0]);
       setStatus("Found "+hits.length+" $MFT - using "+hits[0]+(hits.length>1?" (edit the path if you meant another)":""),"ok");
     },30);
   };
@@ -1968,7 +2003,7 @@ function init(){
   $("iocLoad").onclick=function(){ $("iocPick").click(); };
   $("iocPick").onchange=function(){ if(this.value){ try{ $("iocBox").value=readText(this.value); }catch(e){ setStatus("Could not read IOC file: "+e.message,"err"); } } };
 
-  $("outBrowse").onclick=function(){ var p=browseFolder("Select an output folder for the report and CSVs."); if(p) $("outDir").value=p; };
+  $("outBrowse").onclick=function(){ var p=browseFolder("Select an output folder for the report and CSVs."); if(p){ $("outDir").value=p; OUT_TOUCHED=true; } };
   $("outOpen").onclick=function(){ var d=trimStr($("outDir").value); if(d && folderExists(d)){ try{ new ActiveXObject("WScript.Shell").Run('explorer.exe "'+d+'"',1,false); }catch(e){} } };
 
   $("runBtn").onclick=processRun;
@@ -2024,10 +2059,10 @@ function applyCli(cli){ if(!cli.input) return false;
   if(/\.html?$/i.test(cli.input) && fso.FileExists(cli.input)){ appendLog("CLI: opening report "+cli.input); LAST_REPORT=cli.input; window.setTimeout(function(){ openReport(cli.input); },60); return true; }
   if(fso.FolderExists(cli.input)){ var hits=findMfts(cli.input);
     if(!hits.length){ setStatus("CLI: no $MFT found under "+cli.input,"err"); appendLog("CLI: no $MFT under "+cli.input); return false; }
-    $("mftPath").value=hits[0]; var g=guessJ(hits[0]); if(g) $("jPath").value=g; var h=guessHost(hits[0]); if(h) $("hostLabel").value=h; }
-  else if(fso.FileExists(cli.input)){ $("mftPath").value=cli.input; var g2=guessJ(cli.input); if(g2) $("jPath").value=g2; var h2=guessHost(cli.input); if(h2) $("hostLabel").value=h2; }
+    $("mftPath").value=hits[0]; var g=guessJ(hits[0]); if(g) $("jPath").value=g; hostGuessFrom(hits[0]); }
+  else if(fso.FileExists(cli.input)){ $("mftPath").value=cli.input; var g2=guessJ(cli.input); if(g2) $("jPath").value=g2; hostGuessFrom(cli.input); }
   else { setStatus("CLI input not found: "+cli.input,"err"); appendLog("CLI input not found: "+cli.input); return false; }
-  if(cli.outDir) $("outDir").value=cli.outDir;
+  if(cli.outDir){ $("outDir").value=cli.outDir; OUT_TOUCHED=true; hostGuessFrom(cli.outDir); }
   if(cli.auto){ appendLog("CLI: /auto — building report for "+cli.input); window.setTimeout(function(){ processRun(); },200); }
   else setStatus("CLI: $MFT prefilled — click Run to build the report.","muted");
   return true; }
@@ -2110,6 +2145,7 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
     <ul>
       <li><code>&lt;input&gt;</code> — a <code>$MFT</code> file / collection directory (prefilled; report built with <code>/auto</code>), or an existing <code>.html</code> report to re-open.</li>
       <li><code>&lt;outDir&gt;</code> — output directory for the report &amp; CSVs (optional). &nbsp; <code>/auto</code> — build immediately.</li>
+      <li><b>Target hostname</b> is required before processing — it names the output folder <code>_Processed\&lt;host&gt;\MFTECmd</code> next to this app and the <code>&lt;host&gt;-MFT-Report.html</code> filename (family convention shared with the Artifact-Finder). Guessed from <code>Collection-&lt;host&gt;-…</code> paths, a passed <code>_Processed\&lt;host&gt;\</code> outDir, or this machine's name for live paths — overwrite the guess if it's wrong.</li>
     </ul>
     <h3>Notes</h3>
     <ul>

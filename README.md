@@ -108,7 +108,8 @@ The launcher can be started with arguments so an artifact-finder (or a shortcut)
 mshta.exe "MFTECmd-Wrapper.hta" "<inputOrReport>" ["<outDir>"] [/auto]
 ```
 - `<input>` — a `$MFT` file / collection directory (prefilled; the report is built if `/auto`), or an existing `.html` report to re-open.
-- `<outDir>` — output directory for the report and CSVs (optional).
+- `<outDir>` — output directory for the report and CSVs (optional; defaults to `_Processed\<host>\MFTECmd` next to the app).
+- **Target hostname** is required before processing — it names the report file and the `_Processed\<host>\MFTECmd` output folder next to the app (family convention shared with the DFIR-Artifact-Finder). Guessed from `Collection-<host>-…` paths, a passed `_Processed\<host>\` outDir, or this machine's name for live paths — overwrite the guess if it's wrong.
 - `/auto` — build the report immediately.
 
 ## Credits
