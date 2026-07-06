@@ -99,6 +99,17 @@ Computed in the engine, per row, with a reason string behind every tag. `$J` tim
 - The `.hta` **launcher** requires Windows `mshta.exe` (present on every Windows box). The **report** requires only a modern browser (Edge/Chrome) and is fully offline/self-contained — safe to archive in a case folder and reopen years later.
 - **Running from a network location** (mapped drive / UNC): the engine extracts locally first and falls back to `%TEMP%`; the small helper-file IO falls back to ANSI automatically. For full fidelity run from a local path.
 
+## Command line
+
+The launcher can be started with arguments so an artifact-finder (or a shortcut) opens it already pointed at an artifact:
+
+```
+mshta.exe "MFTECmd-Wrapper.hta" "<inputOrReport>" ["<outDir>"] [/auto]
+```
+- `<input>` — a `$MFT` file / collection directory (prefilled; the report is built if `/auto`), or an existing `.html` report to re-open.
+- `<outDir>` — output directory for the report and CSVs (optional).
+- `/auto` — build the report immediately.
+
 ## Credits
 
 - [Eric Zimmerman](https://ericzimmerman.github.io/) for MFTECmd and the EZ Tools suite — this is an unaffiliated wrapper around his parser; all parsing credit is his.
