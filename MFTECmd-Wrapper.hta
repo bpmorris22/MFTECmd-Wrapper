@@ -950,8 +950,10 @@ input[type=text]{width:170px} input.dt{width:98px}
 .chip b{color:var(--fg);font-weight:600}
 #gridwrap{position:relative;margin:2px 16px 8px 16px;border:1px solid var(--bd);border-radius:6px;overflow:auto;background:var(--panel)}
 #ghead{position:sticky;top:0;z-index:5;background:#1c2129;display:flex;border-bottom:1px solid var(--bd);min-width:1330px}
-#ghead div{padding:5px 8px;font-size:12px;color:var(--mut);cursor:pointer;flex:0 0 auto;overflow:hidden;white-space:nowrap;user-select:none}
+#ghead div{position:relative;padding:5px 8px;font-size:12px;color:var(--mut);cursor:pointer;flex:0 0 auto;overflow:hidden;white-space:nowrap;user-select:none}
 #ghead div:hover{color:var(--blu)}
+#ghead div.cgrip{position:absolute;top:0;right:0;width:8px;height:100%;padding:0;margin:0;cursor:col-resize;z-index:6}
+#ghead div.cgrip:hover{background:#58a6ff;opacity:.45}
 #spacer{position:relative;min-width:1330px}
 #rows{position:absolute;left:0;top:0;right:0}
 .r{display:flex;height:24px;line-height:23px;font-size:12px;border-bottom:1px solid #1b2028;cursor:pointer;min-width:1330px}
@@ -1182,13 +1184,91 @@ function renderHead(){
     arr=(s.k===c[i].k)?(s.d>0?ARR_UP:ARR_DN):"";
     h+='<div data-k="'+c[i].k+'" style="width:'+c[i].w+'px">'+esc(c[i].h)+arr+'</div>';}
   $("ghead").innerHTML=h;
+  var hs=$("ghead").children, g;
+  for(i=0;i<hs.length;i++){
+    g=document.createElement("div"); g.className="cgrip"; g.setAttribute("data-ci",String(i));
+    g.title="Drag to resize column - double-click to reset all widths";
+    g.onmousedown=gripDown; g.ondblclick=gripReset;
+    hs[i].appendChild(g);
+  }
+  applyGridWidth();
 }
 $("ghead").onclick=function(e){
+  if(e.target&&/\bcgrip\b/.test(e.target.className+""))return;
   var t=e.target.closest("div[data-k]"); if(!t)return;
   var s=VIEW==="j"?SORT.j:SORT.m, k=parseInt(t.dataset.k,10);
   if(s.k===k)s.d=-s.d; else {s.k=k;s.d=-1;}
   sortNow(); layoutGrid(); renderHead();
 };
+
+// ---- column resize (drag a header cell's right edge; dblclick a grip resets the
+//      view's widths; widths persist per view in localStorage when available and
+//      are ignored on a column-count mismatch)
+var DEFW={j:[],m:[]};
+(function(){var i;for(i=0;i<COLS_J.length;i++)DEFW.j.push(COLS_J[i].w);
+  for(i=0;i<COLS_M.length;i++)DEFW.m.push(COLS_M[i].w)})();
+function colwKey(v){return "mftecmd-colw-"+v}
+function colsOf(v){return v==="j"?COLS_J:COLS_M}
+function loadColw(v){
+  try{
+    var s=localStorage.getItem(colwKey(v)); if(!s)return;
+    var a=JSON.parse(s), c=colsOf(v), i, w;
+    if(!a||a.length!==c.length)return;
+    for(i=0;i<c.length;i++){w=parseInt(a[i],10); if(w>=40&&w<=1600)c[i].w=w}
+  }catch(e){}
+}
+function saveColw(){
+  try{
+    var c=cols(), a=[], i; for(i=0;i<c.length;i++)a.push(c[i].w);
+    localStorage.setItem(colwKey(VIEW),JSON.stringify(a));
+  }catch(e){}
+}
+function clearColw(){try{localStorage.removeItem(colwKey(VIEW))}catch(e){}}
+function applyGridWidth(){
+  var c=cols(), t=0, i; for(i=0;i<c.length;i++)t+=c[i].w;
+  var st=document.getElementById("colwStyle");
+  if(!st){st=document.createElement("style"); st.id="colwStyle";
+    document.getElementsByTagName("head")[0].appendChild(st);}
+  st.textContent="#ghead,#spacer,.r{min-width:"+t+"px}";
+}
+var DRAG=null;
+function gripDown(e){
+  e=e||window.event;
+  var ci=parseInt(this.getAttribute("data-ci"),10), c=cols();
+  if(isNaN(ci)||ci<0||ci>=c.length)return false;
+  DRAG={ci:ci, x:(e.clientX||0), w:c[ci].w, z:(ZOOM||1)};
+  document.onmousemove=gripMove; document.onmouseup=gripUp;
+  document.onselectstart=function(){return false};
+  if(e.preventDefault)e.preventDefault(); e.returnValue=false;
+  if(e.stopPropagation)e.stopPropagation(); e.cancelBubble=true;
+  return false;
+}
+function gripMove(e){
+  e=e||window.event; if(!DRAG)return false;
+  var w=Math.round(DRAG.w+((e.clientX||0)-DRAG.x)/DRAG.z);
+  if(w<40)w=40; if(w>1600)w=1600;
+  cols()[DRAG.ci].w=w;
+  var hd=$("ghead").children[DRAG.ci]; if(hd)hd.style.width=w+"px";
+  var rs=rowsEl.children, k, cell;
+  for(k=0;k<rs.length;k++){cell=rs[k].children[DRAG.ci]; if(cell)cell.style.width=w+"px"}
+  applyGridWidth();
+  return false;
+}
+function gripUp(){
+  document.onmousemove=null; document.onmouseup=null; document.onselectstart=null;
+  if(DRAG){DRAG=null; saveColw(); renderWindow(true)}
+}
+function gripReset(e){
+  e=e||window.event;
+  document.onmousemove=null; document.onmouseup=null; document.onselectstart=null; DRAG=null;
+  var c=cols(), d=(VIEW==="j"?DEFW.j:DEFW.m), i;
+  for(i=0;i<c.length;i++)c[i].w=d[i];
+  clearColw(); renderHead(); renderWindow(true);
+  if(e){if(e.stopPropagation)e.stopPropagation(); e.cancelBubble=true}
+  return false;
+}
+loadColw("j"); loadColw("m");
+
 var gw=$("gridwrap"), spacer=$("spacer"), rowsEl=$("rows");
 function layoutGrid(){
   spacer.style.height=(filtered.length*ROWH)+"px";
@@ -1451,7 +1531,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.1.2";
+var APP_VERSION = "1.2.0";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
