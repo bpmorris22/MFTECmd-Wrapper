@@ -42,6 +42,15 @@
   html{margin:0;height:100%;background:#0d1117}
   body{margin:0;height:100%;background:#0d1117;color:#e6edf3;font-family:Segoe UI,Tahoma,sans-serif;font-size:16px}
   #content{zoom:0.9}
+  .modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.66);z-index:1000;overflow:auto}
+  .modal .mcard{max-width:780px;margin:36px auto;background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 22px}
+  .modal h2{margin:0 0 6px;font-size:18px;font-weight:600}
+  .modal h3{margin:12px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e}
+  .modal ul{margin:4px 0;padding-left:20px}.modal li{margin:3px 0;font-size:13px}
+  .modal p{font-size:13px;margin:6px 0}
+  .modal code{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:2px 6px;font-family:Consolas,monospace;font-size:12px}
+  .modal .x{float:right;cursor:pointer;color:#8b949e;font-size:22px;line-height:1}.modal .x:hover{color:#e6edf3}
+  .modal .gh{font-family:Consolas,monospace;font-size:12px}
   a{color:#58a6ff}
   .mono{font-family:Consolas,"Courier New",monospace}
   .muted{color:#8b949e}
@@ -79,6 +88,7 @@
   <span class="pill" id="verpill">version: checking&hellip;</span>
   <span class="pill" id="modepill">launcher</span>
   <span style="float:right">
+    <button class="btn" id="helpBtn" onclick="openHelp()" title="Help, about &amp; GitHub link">Help</button>
     <button class="btn" id="fdown" title="Smaller text">A&minus;</button>
     <button class="btn" id="fup" title="Larger text">A+</button>
   </span>
@@ -1440,7 +1450,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.1.0";
+var APP_VERSION = "1.1.1";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1896,7 +1906,24 @@ function init(){
 /* ---------- command-line invocation: "<inputOrReport>" ["<outDir>"] [/auto] ----------
    .htm/.html → open an existing report; a $MFT file or a collection directory → prefill (+build if /auto).
    Lets an external artifact-finder open the analyzer already pointed at a $MFT (or re-open a prior report). */
-function tokenizeCmdTail(){ var cl=""; try{ cl=mftHta.commandLine+""; }catch(e){ return []; }
+/* HTA:APPLICATION.commandLine is UNDEFINED in IE=edge document mode (a known mshta quirk that silently
+   kills CLI args). Recover it from WMI: the newest mshta.exe process whose command line names this .hta. */
+function getCommandLine(){
+  try{ var cl=mftHta.commandLine+""; if(cl && cl!=="undefined") return cl; }catch(e){}
+  try{
+    var lp=decodeURIComponent(location.pathname+"").replace(/^\//,"").replace(/\//g,"\\");
+    var fn=lp.substring(lp.lastIndexOf("\\")+1).toLowerCase(); if(!fn) return "";
+    var loc=new ActiveXObject("WbemScripting.SWbemLocator"), svc=loc.ConnectServer(".","root\\cimv2");
+    var q=svc.ExecQuery("SELECT CommandLine,CreationDate FROM Win32_Process WHERE Name='mshta.exe'");
+    var best="", bestDate="", en=new Enumerator(q);
+    for(; !en.atEnd(); en.moveNext()){ var pr=en.item(); var pcl=(pr.CommandLine==null?"":pr.CommandLine+"");
+      if(pcl.toLowerCase().indexOf(fn)<0) continue; var cd=(pr.CreationDate==null?"":pr.CreationDate+"");
+      if(!best || cd>bestDate){ best=pcl; bestDate=cd; } }
+    return best;
+  }catch(e2){}
+  return "";
+}
+function tokenizeCmdTail(){ var cl=getCommandLine(); if(!cl) return [];
   var m=cl.match(/\.hta"?/i); var tail=m?cl.substring(m.index+m[0].length):cl;
   var toks=[],i=0,n=tail.length,cur="",inq=false;
   while(i<n){ var c=tail.charAt(i);
@@ -1924,12 +1951,44 @@ function applyCli(cli){ if(!cli.input) return false;
   else setStatus("CLI: $MFT prefilled — click Run to build the report.","muted");
   return true; }
 
+/* ---------- help / about overlay ---------- */
+var GITHUB="https://github.com/bpmorris22/MFTECmd-Wrapper";
+function openUrl(u){ try{ new ActiveXObject("WScript.Shell").Run('"'+u+'"',1,false); }catch(e){ setStatus("Could not open browser: "+e.message,"err"); } }
+function openHelp(){ try{ $("helpVer").innerHTML="v"+APP_VERSION; }catch(e){} var m=$("helpModal"); m.className=m.className.replace(/\s*\bhide\b/g,""); }
+function closeHelp(){ var m=$("helpModal"); if(!/\bhide\b/.test(m.className)) m.className+=" hide"; }
+
 window.onload=init;
 </script>
 
 <input type="file" id="mftPick" class="hide">
 <input type="file" id="jPick" class="hide">
 <input type="file" id="iocPick" class="hide">
+
+<div id="helpModal" class="modal hide" onclick="if((event.srcElement||{}).id==='helpModal')closeHelp()">
+  <div class="mcard">
+    <span class="x" onclick="closeHelp()" title="Close">&times;</span>
+    <h2>MFTECmd Wrapper <span class="muted" style="font-size:13px;font-weight:400" id="helpVer"></span></h2>
+    <div class="gh muted">GitHub: <span class="lnk" onclick="openUrl(GITHUB)">https://github.com/bpmorris22/MFTECmd-Wrapper</span></div>
+    <p>A single-file launcher that parses the <b>$MFT</b> (and optional <b>$J</b>) with Eric Zimmerman's MFTECmd and builds a self-contained, virtualized-grid <b>HTML timeline report</b> that opens in your browser.</p>
+    <h3>Quick start</h3>
+    <ul>
+      <li>Put this <code>.hta</code> next to <code>MFTECmd.exe</code>, or use the update/download button to fetch it.</li>
+      <li>Browse to a <code>$MFT</code> (a sibling <code>$J</code> and host name are auto-detected) or a collection folder, set the host label, then <b>Run</b> — the report builds and opens automatically.</li>
+      <li><b>View report</b> re-opens the last report; the report is offline and safe to archive in the case folder.</li>
+    </ul>
+    <h3>Command line</h3>
+    <p><code>mshta "MFTECmd-Wrapper.hta" "&lt;inputOrReport&gt;" ["&lt;outDir&gt;"] [/auto]</code></p>
+    <ul>
+      <li><code>&lt;input&gt;</code> — a <code>$MFT</code> file / collection directory (prefilled; report built with <code>/auto</code>), or an existing <code>.html</code> report to re-open.</li>
+      <li><code>&lt;outDir&gt;</code> — output directory for the report &amp; CSVs (optional). &nbsp; <code>/auto</code> — build immediately.</li>
+    </ul>
+    <h3>Notes</h3>
+    <ul>
+      <li>The launcher needs Windows <code>mshta.exe</code>; the report needs only a modern browser (Edge/Chrome) and is fully self-contained. An IOC/keyword list is built in.</li>
+    </ul>
+    <p class="muted" style="font-size:11px">MIT © 2026 Ben Morris — click the link above for the full README &amp; releases.</p>
+  </div>
+</div>
 
 </body>
 </html>
