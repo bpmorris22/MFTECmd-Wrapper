@@ -48,7 +48,8 @@ And a **Timeline ($J)** view of USN events — file-creation bursts, create-then
 ## Features
 
 - **Runs MFTECmd for you** — parses `$MFT`, then `$J` with `-m` (so USN events resolve their parent paths), to timestamped CSVs, in a visible console so the UI never freezes. Re-runs reuse existing CSVs.
-- **Finds the artifacts for you** — point the input at a collection folder and it recursively locates `$MFT`; the sibling `$Extend\$UsnJrnl%3A$J` is auto-filled, and a hostname is guessed from the `Collection-<host>-<date>` folder name. URL-encoded Velociraptor paths (`C%3A`) work as-is.
+- **Finds the artifacts for you** — point the input at a collection folder and it recursively locates `$MFT`; the sibling `$Extend\$UsnJrnl%3A$J` is auto-filled, and a hostname is guessed from the `Collection-<host>-<date>` folder name. URL-encoded Velociraptor paths (`C%3A`) work as-is. You can also point the input straight at a `$UsnJrnl:$J` — see below.
+- **`$MFT` and `$J`, together or alone** *(new in 1.5.0)* — run either artifact on its own or both together (at least one is required). Open a `$UsnJrnl:$J` by itself and the wrapper walks the collected layout to **auto-pair the volume's `$MFT`** (so USN events still resolve their parent paths); if there's no `$MFT` beside it, the journal is parsed **standalone** — fully scored, just with paths unresolved. The report brands itself with whatever it contains.
 - **Self-managing tooling** — finds `MFTECmd.exe` next to the `.hta` (or in a KAPE `Modules\bin`, or `C:\ZimmermanTools`), checks the latest version, and can download a self-contained copy with one click. Sets `DOTNET_ROLL_FORWARD=Major` automatically.
 - **IOCs baked in at parse time** — paste or load terms; they are matched (case-insensitive substring, across full path + name + Zone.Identifier) during parsing, so **hits are guaranteed to survive reduction** and always sort to the top. Add more terms in the report afterwards for an ad-hoc scan of the embedded subset.
 - **Three views of one run**:
@@ -95,7 +96,7 @@ Computed in the engine, per row, with a reason string behind every tag. `$J` tim
 - All timestamps are shown **UTC, as MFTECmd emits them.** No local-time conversion, on purpose — it is the single biggest source of DFIR timeline errors.
 - **`SI<FN` timestomp is noisy.** Tens to hundreds of thousands of rows on a normal disk carry a benign `$SI`/`$FN` mismatch (installers, archive extraction, file copies). The tag is corroborating, not primary — the high-signal tags are `IOC`, `DBLEXT`, `MASQ`, and `CRTDEL`+`BURST`. On a *clean* host the top of the list is expected to be recognizable OS artifacts; a report with **0 IOC hits** and only benign OS noise at the top is a meaningful all-clear.
 - **The report is a reduced view; the CSVs are complete.** If you need a row outside the embedded budget, it is in `.\csv\` — open it in Timeline Explorer, or re-run with a larger budget or a tighter time window.
-- **`$J` only goes back as far as the journal.** The USN journal rolls over; on a busy disk it may only reach back a week or two, so older staging shows only in the `$MFT`. (The engine handles an `$MFT`-only run when no `$J` is available.)
+- **`$J` only goes back as far as the journal.** The USN journal rolls over; on a busy disk it may only reach back a week or two, so older staging shows only in the `$MFT`. (The engine handles an `$MFT`-only run when no `$J` is available — and a `$J`-only run when no `$MFT` is available, in which case USN parent paths are unresolved.)
 - A default-budget report is ~30–50 MB and opens in a second or two in Edge. Very large embedded budgets (200k+) produce larger files.
 - The `.hta` **launcher** requires Windows `mshta.exe` (present on every Windows box). The **report** requires only a modern browser (Edge/Chrome) and is fully offline/self-contained — safe to archive in a case folder and reopen years later.
 - **Running from a network location** (mapped drive / UNC): the engine extracts locally first and falls back to `%TEMP%`; the small helper-file IO falls back to ANSI automatically. For full fidelity run from a local path.
@@ -107,7 +108,7 @@ The launcher can be started with arguments so an artifact-finder (or a shortcut)
 ```
 mshta.exe "MFTECmd-Wrapper.hta" "<inputOrReport>" ["<outDir>"] [/auto]
 ```
-- `<input>` — a `$MFT` file / collection directory (prefilled; the report is built if `/auto`), or an existing `.html` report to re-open.
+- `<input>` — a `$MFT` file / collection directory (prefilled; the report is built if `/auto`), a `$UsnJrnl:$J` file (routed to the `$J` input, with the volume `$MFT` auto-paired when present — the DFIR-Artifact-Finder launches journals this way), or an existing `.html` report to re-open.
 - `<outDir>` — output directory for the report and CSVs (optional; defaults to `_Processed\<host>\MFTECmd` next to the app).
 - **Target hostname** is required before processing — it names the report file and the `_Processed\<host>\MFTECmd` output folder next to the app (family convention shared with the DFIR-Artifact-Finder). Guessed from `Collection-<host>-…` paths, a passed `_Processed\<host>\` outDir, or this machine's name for live paths — overwrite the guess if it's wrong.
 - **Shared IOC list** — if no IOC terms are given, an `IOC.txt` next to the app is passed to the engine automatically (one term per line, `#` comments); one list covers the whole toolkit.

@@ -100,14 +100,14 @@
   <div class="card">
     <h3>Input artifacts</h3>
     <div class="row">
-      <label class="fld">$MFT file (required)</label>
+      <label class="fld">$MFT file (recommended) &mdash; at least one of $MFT / $J is required</label>
       <input class="txt wide mono" id="mftPath" placeholder="path to a collected $MFT (e.g. ...\uploads\ntfs\%5C%5C.%5CC%3A\$MFT)">
       <button class="btn" id="mftBrowse">Browse file&hellip;</button>
       <button class="btn" id="mftDirBrowse">Browse collection&hellip;</button>
     </div>
     <div class="row">
-      <label class="fld">$J USN journal (optional, strongly recommended)</label>
-      <input class="txt wide mono" id="jPath" placeholder="path to $Extend\$UsnJrnl%3A$J - auto-filled when found next to $MFT">
+      <label class="fld">$J USN journal (recommended) &mdash; can also run alone; the $MFT is auto-paired when it sits in the usual collected layout</label>
+      <input class="txt wide mono" id="jPath" placeholder="path to $Extend\$UsnJrnl%3A$J - auto-filled next to a $MFT; auto-pairs a $MFT when supplied alone">
       <button class="btn" id="jBrowse">Browse file&hellip;</button>
       <button class="btn" id="jClear">Clear</button>
     </div>
@@ -182,7 +182,7 @@
 # Contract: exit 0 and print report path on the LAST line; nonzero + message on error.
 # MFTECMD-ENGINE-START
 param(
-    [Parameter(Mandatory=$true)][string]$Mft,
+    [string]$Mft = "",
     [string]$J = "",
     [Parameter(Mandatory=$true)][string]$OutDir,
     [string]$HostLabel = "",
@@ -336,15 +336,19 @@ function ColIx([hashtable]$map, [string]$name) {
 }
 
 # ---------------------------------------------------------------- stage 0: inputs
-if (-not (Test-Path -LiteralPath $Mft)) { Fail ("`$MFT not found: " + $Mft) }
+# v1.5.0: -Mft is now OPTIONAL. Valid combos: MFT-only, MFT+$J, or $J-only (journal only).
+$haveMft = ($Mft -ne "" -and (Test-Path -LiteralPath $Mft))
+if ($Mft -ne "" -and -not $haveMft) { Fail ("`$MFT not found: " + $Mft) }
 $haveJ = ($J -ne "" -and (Test-Path -LiteralPath $J))
 if ($J -ne "" -and -not $haveJ) { Say ("WARN: `$J path not found, continuing MFT-only: " + $J) }
+if (-not $haveMft -and -not $haveJ) { Fail "Need at least one of -Mft / -J (neither was supplied or found)." }
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
 $csvDir = Join-Path $OutDir "csv"
 if (-not (Test-Path -LiteralPath $csvDir)) { New-Item -ItemType Directory -Force -Path $csvDir | Out-Null }
 
 if ($HostLabel -eq "") {
-    if ($Mft -match 'Collection-([A-Za-z0-9\-_]+?)-\d{4}-\d{2}-\d{2}') { $HostLabel = $Matches[1] }
+    $hostSrc = if ($haveMft) { $Mft } else { $J }
+    if ($hostSrc -match 'Collection-([A-Za-z0-9\-_]+?)-\d{4}-\d{2}-\d{2}') { $HostLabel = $Matches[1] }
     else { $HostLabel = "HOST" }
 }
 $safeHost = ($HostLabel -replace '[^A-Za-z0-9\-_\.]', '_')
@@ -390,19 +394,28 @@ function RunTool([string]$args_, [string]$logName) {
     return $LASTEXITCODE
 }
 
-if ((Test-Path -LiteralPath $mftCsv) -and ((Get-Item -LiteralPath $mftCsv).Length -gt 0)) {
-    Say ("[1/6] Reusing existing " + $mftCsv)
+if ($haveMft) {
+    if ((Test-Path -LiteralPath $mftCsv) -and ((Get-Item -LiteralPath $mftCsv).Length -gt 0)) {
+        Say ("[1/6] Reusing existing " + $mftCsv)
+    } else {
+        Say "[1/6] Running MFTECmd on `$MFT ..."
+        $rc = RunTool ("-f `"" + $Mft + "`" --csv `"" + $csvDir + "`" --csvf mft.csv") "mftecmd_mft.log"
+        if ($rc -ne 0 -or -not (Test-Path -LiteralPath $mftCsv)) { Fail ("MFTECmd `$MFT parse failed (rc=" + $rc + ") - see " + (Join-Path $csvDir "mftecmd_mft.log")) }
+    }
 } else {
-    Say "[1/6] Running MFTECmd on `$MFT ..."
-    $rc = RunTool ("-f `"" + $Mft + "`" --csv `"" + $csvDir + "`" --csvf mft.csv") "mftecmd_mft.log"
-    if ($rc -ne 0 -or -not (Test-Path -LiteralPath $mftCsv)) { Fail ("MFTECmd `$MFT parse failed (rc=" + $rc + ") - see " + (Join-Path $csvDir "mftecmd_mft.log")) }
+    Say "[1/6] No `$MFT supplied - journal-only run (ParentPath will be unresolved)."
 }
 if ($haveJ) {
     if ((Test-Path -LiteralPath $jCsv) -and ((Get-Item -LiteralPath $jCsv).Length -gt 0)) {
         Say ("[1/6] Reusing existing " + $jCsv)
     } else {
         Say "[1/6] Running MFTECmd on `$J ..."
-        $rc = RunTool ("-f `"" + $J + "`" -m `"" + $Mft + "`" --csv `"" + $csvDir + "`" --csvf j.csv") "mftecmd_j.log"
+        # -m resolves ParentPath from the $MFT; drop it for a standalone journal parse.
+        # (Verified 2026-07-07: J-only CSV keeps the same columns - ParentPath is just empty.)
+        $jArgs = "-f `"" + $J + "`""
+        if ($haveMft) { $jArgs += " -m `"" + $Mft + "`"" }
+        $jArgs += " --csv `"" + $csvDir + "`" --csvf j.csv"
+        $rc = RunTool $jArgs "mftecmd_j.log"
         if ($rc -ne 0 -or -not (Test-Path -LiteralPath $jCsv)) { Fail ("MFTECmd `$J parse failed (rc=" + $rc + ") - see " + (Join-Path $csvDir "mftecmd_j.log")) }
     }
 }
@@ -411,7 +424,8 @@ if ($haveJ) {
 # kept-row layout (indexes matter - viewer cols map below must match):
 #  0 entry 1 seq 2 deleted 3 parentPath 4 fileName 5 ext 6 size 7 isDir 8 hasAds
 #  9 zoneId 10 cr10 11 cr30 12 mod10 13 acc10 14 score 15 tags 16 why
-Say "[2/6] Parsing + scoring `$MFT csv ..."
+if ($haveMft) { Say "[2/6] Parsing + scoring `$MFT csv ..." }
+else { Say "[2/6] No `$MFT supplied - file scoring skipped (journal-only report)." }
 
 $t1m = New-Object 'System.Collections.Generic.List[object[]]'   # IOC hits
 $t2m = New-Object 'System.Collections.Generic.List[object[]]'   # score >= 4
@@ -423,6 +437,7 @@ $t6mMin = ""      # newest-N threshold: skip rows older than this once bounded
 $mftTotal = 0; $mftDel = 0; $mftAds = 0; $mftStomp = 0; $mftIoc = 0
 $maxTsM = ""
 
+if ($haveMft) {
 $srm = New-Object System.IO.StreamReader($mftCsv, [System.Text.Encoding]::UTF8, $true, 1MB)
 try {
     $hdr = $srm.ReadLine()
@@ -577,6 +592,7 @@ try {
 } finally { $srm.Close() }
 Say ("      `$MFT: " + $mftTotal.ToString("N0") + " rows parsed (" + $mftDel.ToString("N0") + " deleted, " +
      $mftStomp.ToString("N0") + " SI<FN, " + $mftIoc.ToString("N0") + " IOC hits)")
+}   # end if ($haveMft) - stage 2
 
 # ---------------------------------------------------------------- stage 3: parse + score $J
 #  kept-row layout: 0 ts 1 name 2 ext 3 entry 4 seq 5 parentPath 6 updReasons
@@ -1074,10 +1090,11 @@ $("pillGen").innerHTML="generated <b>"+esc(meta.generated)+"</b>";
 $("pillVer").innerHTML="engine <b>"+esc(meta.appVersion)+"</b> &middot; MFTECmd <b>"+esc(meta.mftecmdVersion)+"</b>";
 (function(){
   var dm=0,dj=0,k;for(k in meta.mftDrop)dm+=meta.mftDrop[k];for(k in meta.jDrop)dj+=meta.jDrop[k];
-  $("banner").innerHTML="Showing <b>"+nfmt(meta.mftKept)+"</b> of "+nfmt(meta.mftTotal)+" $MFT rows and <b>"+nfmt(meta.jKept)+"</b> of "+nfmt(meta.jTotal)+
+  $("banner").innerHTML=(meta.inputMft?"":"<b>Journal-only run</b> &mdash; no $MFT, so ParentPath is unresolved. ")+
+    "Showing <b>"+nfmt(meta.mftKept)+"</b> of "+nfmt(meta.mftTotal)+" $MFT rows and <b>"+nfmt(meta.jKept)+"</b> of "+nfmt(meta.jTotal)+
     " $J rows (budget "+nfmt(meta.budget)+"/set; "+nfmt(dm)+" / "+nfmt(dj)+" lowest-priority rows not embedded). "+
     "IOC terms baked at parse time: "+DATA.iocs.length+". Full CSVs: <span class='mono'>"+esc(meta.csvDir)+"</span>";
-  $("foot").innerHTML="Host <b>"+esc(meta.host)+"</b> &middot; input "+esc(meta.inputMft)+(meta.inputJ?" + $J":" (no $J)")+
+  $("foot").innerHTML="Host <b>"+esc(meta.host)+"</b> &middot; input "+(meta.inputMft?esc(meta.inputMft):"(no $MFT &mdash; journal only, ParentPath unresolved)")+(meta.inputJ?" + $J":" (no $J)")+
     " &middot; window "+(meta.winFrom?esc(meta.winFrom)+" .. "+esc(meta.winTo):"none")+" &middot; recent-cut "+esc(meta.recentCut)+
     " &middot; all timestamps UTC as emitted by MFTECmd";
 })();
@@ -1531,7 +1548,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.4.0";
+var APP_VERSION = "1.5.0";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1789,6 +1806,23 @@ function guessJ(mft){
   for(var i=0;i<cands.length;i++){ try{ if(fso.FileExists(cands[i])) return cands[i]; }catch(e){} }
   return "";
 }
+/* v1.5.0: a collected USN journal is named "$UsnJrnl%3A$J" (Velociraptor keeps the literal %3A
+   in the filename) or exactly "$J". Such a file routes to the $J input, never to $MFT. The %3A
+   is part of the filename on disk - never unescape it. */
+function isJName(p){ var b=baseName(p).toLowerCase(); return b.indexOf("$usnjrnl")>=0 || b==="$j"; }
+/* v1.5.0: reverse of guessJ - given a $UsnJrnl:$J, find the volume $MFT by walking UP.
+   Collected layout: ...\ntfs\<vol>\$Extend\$UsnJrnl%3A$J  with  ...\ntfs\<vol>\$MFT (two up).
+   Flat exports may sit them side by side (one up). Auto-pairing upgrades a J-only run to a full
+   MFT+$J run with resolved ParentPath. */
+function guessMft(j){
+  if(!j) return "";
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var p1=parentDir(j);              // ...\$Extend  (or the flat export dir)
+  var p2=parentDir(p1);             // ...\<vol>
+  var cands=[ p2+"\\$MFT", p1+"\\$MFT" ];
+  for(var i=0;i<cands.length;i++){ try{ if(fso.FileExists(cands[i])) return cands[i]; }catch(e){} }
+  return "";
+}
 /* pull a hostname-ish token out of a Velociraptor collection path, a _Processed\<host>\ path,
    or fall back to this machine's name for live-system paths (C:\Windows, C:\Users) */
 function guessHost(p){
@@ -1873,9 +1907,10 @@ function writeRunInfo(outdir, input, freshFiles){
 function processRun(){
   if(BUSY){ setStatus("A run is already in progress.","err"); return; }
   var mft=trimStr($("mftPath").value);
-  if(!mft || !fileExists(mft)){ setStatus("Pick a valid $MFT file first.","err"); return; }
+  if(mft && !fileExists(mft)){ setStatus("The $MFT path is set but does not exist - clear it or fix it.","err"); return; }
   var j=trimStr($("jPath").value);
   if(j && !fileExists(j)){ setStatus("The $J path is set but does not exist - clear it or fix it.","err"); return; }
+  if(!mft && !j){ setStatus("Pick a $MFT and/or a $UsnJrnl:$J file first (at least one is required).","err"); return; }
   if(!EXE || !fileExists(EXE)){ setStatus("MFTECmd.exe not found - use 'Update / download MFTECmd'.","err"); return; }
 
   var host=requireHost(); if(!host) return;
@@ -1912,7 +1947,7 @@ function processRun(){
   // build the PS invocation. Engine args are passed as -File params (single-% paths).
   var q=function(s){ return '"'+String(s).replace(/"/g,'\\"')+'"'; };
   var psArgs="-NoProfile -ExecutionPolicy Bypass -File "+q(ENGINE_PS1)
-    +" -Mft "+q(mft)
+    +(mft?(" -Mft "+q(mft)):"")
     +(j?(" -J "+q(j)):"")
     +" -OutDir "+q(outDir)
     +" -HostLabel "+q(host)
@@ -1927,7 +1962,7 @@ function processRun(){
   setStatus("Running MFTECmd + engine… a console window shows live progress.","muted");
   appendLog("=== MFTECmd Wrapper run "+(new Date())+" ===");
   appendLog("engine: "+ENGINE_PS1);
-  appendLog("host="+host+"  budget="+budget+"  $J="+(j?"yes":"no")+"  iocs="+(iocFile?"yes":"none"));
+  appendLog("host="+host+"  budget="+budget+"  $MFT="+(mft?"yes":"no")+"  $J="+(j?"yes":"no")+"  iocs="+(iocFile?"yes":"none"));
 
   // batEsc only the wrapping .bat line (the powershell command line itself is a bat line)
   var ctx=runBatAsync([ "powershell "+batEsc(psArgs)+" > \"__LOG__\" 2>&1" ], true);
@@ -1948,7 +1983,7 @@ function processRun(){
     if(mode==="stable") appendLog("(completion detected from the finished report file; the temp done-marker was not seen - harmless.)");
     LAST_REPORT=rep; $("viewBtn").disabled=false;
     if(iocFile && iocTemp){ try{ fso.DeleteFile(iocFile); }catch(e3){} }   // never delete the shared toolkit IOC.txt
-    writeRunInfo(outDir, mft, [baseName(rep)]);
+    writeRunInfo(outDir, (mft?mft:j), [baseName(rep)]);
     setStatus("Report ready: "+rep,"ok");
     appendLog("Report: "+rep);
     openReport(rep);
@@ -2004,11 +2039,17 @@ function init(){
 
   // hidden native file pickers
   $("mftBrowse").onclick=function(){ $("mftPick").click(); };
-  $("mftPick").onchange=function(){ if(this.value){ $("mftPath").value=this.value;
+  $("mftPick").onchange=function(){ if(this.value){
+    // a $UsnJrnl:$J picked here belongs in the $J box - route it and auto-pair the $MFT
+    if(isJName(this.value)){ $("jPath").value=this.value; var mpp=guessMft(this.value); if(mpp) $("mftPath").value=mpp; hostGuessFrom(mpp||this.value);
+      setStatus(mpp?"That's a $UsnJrnl:$J - moved it to the $J box and auto-paired the volume $MFT.":"That's a $UsnJrnl:$J - moved it to the $J box (no sibling $MFT found; will run journal-only).","ok"); return; }
+    $("mftPath").value=this.value;
     var g=guessJ(this.value); if(g && !trimStr($("jPath").value)){ $("jPath").value=g; setStatus("Found a sibling $J and filled it in.","ok"); }
     hostGuessFrom(this.value); } };
   $("jBrowse").onclick=function(){ $("jPick").click(); };
-  $("jPick").onchange=function(){ if(this.value) $("jPath").value=this.value; };
+  $("jPick").onchange=function(){ if(this.value){ $("jPath").value=this.value;
+    // supplied a journal with no $MFT yet - try to auto-pair the volume $MFT (reverse of guessJ)
+    if(!trimStr($("mftPath").value)){ var mpj=guessMft(this.value); if(mpj){ $("mftPath").value=mpj; hostGuessFrom(mpj); setStatus("Auto-paired the volume $MFT for this journal.","ok"); } } } };
   $("jClear").onclick=function(){ $("jPath").value=""; };
 
   $("mftDirBrowse").onclick=function(){
@@ -2086,11 +2127,17 @@ function applyCli(cli){ if(!cli.input) return false;
   if(fso.FolderExists(cli.input)){ var hits=findMfts(cli.input);
     if(!hits.length){ setStatus("CLI: no $MFT found under "+cli.input,"err"); appendLog("CLI: no $MFT under "+cli.input); return false; }
     $("mftPath").value=hits[0]; var g=guessJ(hits[0]); if(g) $("jPath").value=g; hostGuessFrom(hits[0]); }
-  else if(fso.FileExists(cli.input)){ $("mftPath").value=cli.input; var g2=guessJ(cli.input); if(g2) $("jPath").value=g2; hostGuessFrom(cli.input); }
+  else if(fso.FileExists(cli.input)){
+    if(isJName(cli.input)){ // $UsnJrnl:$J launched directly (e.g. by the Artifact-Finder) - route to $J, auto-pair $MFT
+      $("jPath").value=cli.input; var mp=guessMft(cli.input);
+      if(mp){ $("mftPath").value=mp; appendLog("CLI: $J input; auto-paired $MFT "+mp); } else { appendLog("CLI: $J input; no sibling $MFT found - journal-only run"); }
+      hostGuessFrom(mp||cli.input);
+    } else { $("mftPath").value=cli.input; var g2=guessJ(cli.input); if(g2) $("jPath").value=g2; hostGuessFrom(cli.input); }
+  }
   else { setStatus("CLI input not found: "+cli.input,"err"); appendLog("CLI input not found: "+cli.input); return false; }
   if(cli.outDir){ $("outDir").value=cli.outDir; OUT_TOUCHED=true; hostGuessFrom(cli.outDir); }
   if(cli.auto){ appendLog("CLI: /auto — building report for "+cli.input); window.setTimeout(function(){ processRun(); },200); }
-  else setStatus("CLI: $MFT prefilled — click Run to build the report.","muted");
+  else setStatus("CLI: input prefilled — click Run to build the report.","muted");
   return true; }
 
 /* ---------- help / about overlay ---------- */
@@ -2170,6 +2217,7 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
     <p><code>mshta "MFTECmd-Wrapper.hta" "&lt;inputOrReport&gt;" ["&lt;outDir&gt;"] [/auto]</code></p>
     <ul>
       <li><code>&lt;input&gt;</code> — a <code>$MFT</code> file / collection directory (prefilled; report built with <code>/auto</code>), or an existing <code>.html</code> report to re-open.</li>
+      <li>…or a <code>$UsnJrnl:$J</code> alone — the wrapper auto-pairs the volume's <code>$MFT</code> when it sits in the usual collected layout; without one the journal is parsed standalone (no ParentPath). At least one of <code>$MFT</code> / <code>$J</code> is required.</li>
       <li><code>&lt;outDir&gt;</code> — output directory for the report &amp; CSVs (optional). &nbsp; <code>/auto</code> — build immediately.</li>
       <li><b>Target hostname</b> is required before processing — it names the output folder <code>_Processed\&lt;host&gt;\MFTECmd</code> next to this app and the <code>&lt;host&gt;-MFT-Report.html</code> filename (family convention shared with the Artifact-Finder). Guessed from <code>Collection-&lt;host&gt;-…</code> paths, a passed <code>_Processed\&lt;host&gt;\</code> outDir, or this machine's name for live paths — overwrite the guess if it's wrong.</li>
       <li><b>Shared IOC list</b>: if no IOC file is chosen, an <code>IOC.txt</code> next to this app is used automatically (one term per line, <code>#</code> comments) — one list covers the whole toolkit.</li>
