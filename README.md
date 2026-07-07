@@ -106,7 +106,7 @@ Computed in the engine, per row, with a reason string behind every tag. `$J` tim
 The launcher can be started with arguments so an artifact-finder (or a shortcut) opens it already pointed at an artifact:
 
 ```
-mshta.exe "MFTECmd-Wrapper.hta" "<inputOrReport>" ["<outDir>"] [/auto]
+mshta.exe "MFTECmd-Wrapper.hta" "<inputOrReport>" ["<outDir>"] [/auto] [/from:yyyy-MM-dd] [/to:yyyy-MM-dd]
 ```
 - `<input>` — a `$MFT` file / collection directory (prefilled; the report is built if `/auto`), a `$UsnJrnl:$J` file (routed to the `$J` input, with the volume `$MFT` auto-paired when present — the DFIR-Artifact-Finder launches journals this way), or an existing `.html` report to re-open.
 - `<outDir>` — output directory for the report and CSVs (optional; defaults to `_Processed\<host>\MFTECmd` next to the app).
@@ -114,6 +114,7 @@ mshta.exe "MFTECmd-Wrapper.hta" "<inputOrReport>" ["<outDir>"] [/auto]
 - **Shared IOC list** — if no IOC terms are given, an `IOC.txt` next to the app is passed to the engine automatically (one term per line, `#` comments); one list covers the whole toolkit.
 - **Run provenance** — every successful run appends a `runinfo.json` entry (app, host, $MFT path, report name) in the output folder; the DFIR-Artifact-Finder uses it to show processed state even for standalone runs.
 - `/auto` — build the report immediately.
+- `/from:yyyy-MM-dd` `/to:yyyy-MM-dd` — case window (UTC, inclusive): prefills the date filter and is recorded in `runinfo.json`; never affects scoring. The [DFIR-Artifact-Finder](https://github.com/bpmorris22/DFIR-Artifact-Finder) passes these on every launch.
 
 ## Credits
 
