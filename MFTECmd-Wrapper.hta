@@ -41,7 +41,7 @@
 <style>
   html{margin:0;height:100%;background:#0d1117}
   body{margin:0;height:100%;background:#0d1117;color:#e6edf3;font-family:Segoe UI,Tahoma,sans-serif;font-size:16px}
-  #content{zoom:0.9}
+  #content{zoom:0.9;width:111.111%;box-sizing:border-box}
   .modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.66);z-index:1000;overflow:auto}
   .modal .mcard{max-width:780px;margin:36px auto;background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 22px}
   .modal h2{margin:0 0 6px;font-size:18px;font-weight:600}
@@ -77,7 +77,7 @@
   .sep{display:inline-block;width:1px;height:18px;background:#30363d;margin:0 6px;vertical-align:middle}
   #status{margin:6px 0;font-size:12px}
   #exeline{font-size:11px;color:#8b949e;margin-top:6px}
-  #log{white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;color:#8b949e;max-height:280px;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;display:none;margin-top:8px}
+  #log{white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;color:#8b949e;max-height:280px;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;display:none;margin-top:8px;width:100%;box-sizing:border-box}
   .hide{display:none}
   .grid2{display:inline-block;width:49%;vertical-align:top}
 </style>
@@ -88,6 +88,7 @@
   <span class="pill" id="verpill">version: checking&hellip;</span>
   <span class="pill" id="modepill">launcher</span>
   <span style="float:right">
+    <button class="btn" id="instrBtn" onclick="openInstructions()" title="Download the latest HTML field guide from GitHub and open it in your browser">Instructions</button>
     <button class="btn" id="helpBtn" onclick="openHelp()" title="Help, about &amp; GitHub link">Help</button>
     <button class="btn primary hide" id="selfUpd" onclick="doSelfUpdate()" title="A newer version is available on GitHub">Update</button>
     <button class="btn" id="fdown" title="Smaller text">A&minus;</button>
@@ -1548,7 +1549,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.6.0";
+var APP_VERSION = "1.6.1";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -2033,7 +2034,7 @@ function init(){
 
   var zoom=0.9;
   var zContent=$("content");
-  function applyZoom(){ zContent.style.zoom=zoom; var p=Math.round(zoom*100)+"%";
+  function applyZoom(){ zContent.style.zoom=zoom; zContent.style.width=(100/zoom)+"%"; var p=Math.round(zoom*100)+"%";
     $("fup").title="Larger text ("+p+")"; $("fdown").title="Smaller text ("+p+")"; }
   applyZoom();
   $("fup").onclick=function(){ zoom=Math.min(zoom+0.15,2.5); applyZoom(); };
@@ -2162,6 +2163,42 @@ function openUrl(u){ try{ new ActiveXObject("WScript.Shell").Run('"'+u+'"',1,fal
 function openHelp(){ try{ $("helpVer").innerHTML="v"+APP_VERSION; }catch(e){} var m=$("helpModal"); m.className=m.className.replace(/\s*\bhide\b/g,""); }
 function closeHelp(){ var m=$("helpModal"); if(!/\bhide\b/.test(m.className)) m.className+=" hide"; }
 
+/* ---------- Instructions: download the latest shared Toolkit field manual and open it ---------- */
+var MANUAL_URL="https://raw.githubusercontent.com/bpmorris22/DFIR-Windows-Artifact-Finder/main/docs/DFIR-Toolkit-Manual.html";
+var MANUAL_FILE="DFIR-Toolkit-Manual.html";
+function openManualFile(path){
+  try{ new ActiveXObject("WScript.Shell").Run('explorer.exe "'+path+'"',1,false); return true; }
+  catch(e){ setStatus("Downloaded the field guide, but could not open it: "+e.message,"err"); return false; }
+}
+function openInstructions(){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var dest=fso.GetSpecialFolder(2)+"\\"+MANUAL_FILE;   // %TEMP% — overwritten each click with the latest
+  setStatus("Downloading the field guide from GitHub (~5 MB)…","muted");
+  var ps1=fso.GetSpecialFolder(2)+"\\man_"+uid()+".ps1";
+  var dq=String(dest).replace(/'/g,"''");
+  var L=[];
+  L.push("$ErrorActionPreference='Stop'");
+  L.push("[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12");
+  L.push("Invoke-WebRequest -UseBasicParsing -Uri '"+MANUAL_URL+"' -OutFile '"+dq+"' -Headers @{ 'User-Agent'='MFTECmd-Wrapper' }");
+  L.push("if((Get-Item '"+dq+"').Length -lt 2000){ throw 'downloaded file too small' }");
+  L.push("Write-Output 'MAN_OK'");
+  try{ var f=fso.CreateTextFile(ps1,true); f.Write(L.join("\r\n")); f.Close(); }
+  catch(ew){ setStatus("Could not stage the field-guide download: "+ew.message,"err"); return; }
+  var r=runBatSync(['powershell -NoProfile -ExecutionPolicy Bypass -File "'+ps1+'" > "__LOG__" 2>&1']);
+  try{ fso.DeleteFile(ps1); }catch(e0){}
+  if((r.log+"").indexOf("MAN_OK")>=0 && fileExists(dest)){
+    if(openManualFile(dest)) setStatus("Field guide downloaded and opened in your browser.","ok");
+    appendLog("Field guide: downloaded latest -> "+dest);
+  } else {
+    appendLog("--- field-guide download ---\n"+r.log);
+    if(fileExists(dest)){
+      if(openManualFile(dest)) setStatus("Download failed (offline?) — opened the previously downloaded copy.","muted");
+    } else {
+      setStatus("Field-guide download failed (offline, or the file moved). See log; or open it from the GitHub repo.","err");
+    }
+  }
+}
+
 /* ---------- self-update: quiet check of this app's GitHub Releases; one-click download of a newer .hta ---------- */
 var SELF_REPO="bpmorris22/MFTECmd-Wrapper", SELF_HTA="MFTECmd-Wrapper.hta", SELF_LATEST="", SELF_ASSET_URL="";
 function selfVerNewer(r,l){ var a=String(r).split("."),b=String(l).split("."),n=Math.max(a.length,b.length);
@@ -2202,7 +2239,7 @@ function doSelfUpdate(){
     "if((Get-Item $tmp).Length -lt 2000){ throw 'downloaded file too small' }",
     "Copy-Item $tmp $t -Force","Remove-Item $tmp -Force -ErrorAction SilentlyContinue","Write-Output 'SELFUPD_OK'"];
   try{ var f=fso.CreateTextFile(ps1,true); f.Write(L.join("\r\n")); f.Close(); }catch(ew){ setStatus("Self-update stage failed: "+ew.message,"err"); return; }
-  try{ var r=runBat(['powershell -NoProfile -ExecutionPolicy Bypass -File "'+ps1+'" > "__LOG__" 2>&1']);
+  try{ var r=runBatSync(['powershell -NoProfile -ExecutionPolicy Bypass -File "'+ps1+'" > "__LOG__" 2>&1']);
     try{ fso.DeleteFile(ps1); }catch(e0){}
     if((r.log+"").indexOf("SELFUPD_OK")>=0){ var b=$("selfUpd"); if(b) b.className="btn primary hide";
       setStatus("Updated to v"+SELF_LATEST+" — CLOSE and reopen the app to run the new version.","ok");
