@@ -60,7 +60,7 @@ And a **Timeline ($J)** view of USN events — file-creation bursts, create-then
 - **Resizable report columns** *(new in 1.2.0)* — drag a header cell's right edge to resize any column; widths persist per view (browser localStorage) and double-clicking a resize grip restores the defaults.
 - **"Story of an entry" detail pane** — click any row: all timestamps with the SI/FN timestomp delta highlighted, the Zone.Identifier download source, the score breakdown, and cross-links between an `$MFT` record and every `$J` event for the same entry — creation, writes, renames, deletion, in one place.
 - **Suspicion scoring** tuned on real incident data (table below). Suspicious rows are shaded; every tag carries its reasoning.
-- **Filters & reporting** — free-text search, tag chips with live counts, UTC date range, extension and path-scope filters (all persist across views); export the filtered view to CSV, or copy formatted lines into case notes.
+- **Filters & reporting** — free-text search, tag chips with live counts, UTC date range, extension, path-scope, and per-user filters (the user is derived from `\Users\<name>\` in the path — click any row's User cell to isolate it; all filters persist across views); export the filtered view to CSV, or copy formatted lines into case notes.
 
 ## Quick start
 

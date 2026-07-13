@@ -181,7 +181,9 @@
      Do NOT hand-edit inside the markers - edit MFTECmd-Engine.ps1 and re-splice. -->
 <script type="text/plain" id="ps1Payload">
 # MFTECmd-Engine.ps1 - parse/score/reduce/report engine for MFTECmd-Wrapper.
-# Phase 1: standalone script (later embedded in MFTECmd-Wrapper.hta).
+# Embedded into MFTECmd-Wrapper.hta by build-hta.ps1; also runs standalone.
+# The viewer template below is the AUTHORITATIVE copy; viewer-template.html is
+# kept in sync via splice-viewer.ps1 (-Extract regenerates the .html from here).
 # Target: Windows PowerShell 5.1. ASCII only. All timestamps UTC, never localized.
 # Contract: exit 0 and print report path on the LAST line; nonzero + message on error.
 # MFTECMD-ENGINE-START
@@ -366,10 +368,17 @@ if ($IocFile -ne "" -and (Test-Path -LiteralPath $IocFile)) {
 }
 $nIoc = $IOCS.Count
 
-# normalize window bounds to sortable 'yyyy-MM-dd HH:mm:ss' strings
+# normalize window bounds to sortable 'yyyy-MM-dd HH:mm:ss' strings.
+# must start yyyy-MM-dd (free-text HTA field) - anything shorter would throw on Substring
 $winFrom = ""; $winTo = ""
-if ($From -ne "") { $winFrom = ($From.Trim() + " 00:00:00").Substring(0,19) }
-if ($To -ne "")   { $winTo   = ($To.Trim()   + " 23:59:59").Substring(0,19) }
+if ($From -ne "") {
+    if ($From.Trim() -notmatch '^\d{4}-\d{2}-\d{2}') { Fail ("-From must be yyyy-MM-dd (got '" + $From + "')") }
+    $winFrom = ($From.Trim() + " 00:00:00").Substring(0,19)
+}
+if ($To -ne "") {
+    if ($To.Trim() -notmatch '^\d{4}-\d{2}-\d{2}') { Fail ("-To must be yyyy-MM-dd (got '" + $To + "')") }
+    $winTo = ($To.Trim() + " 23:59:59").Substring(0,19)
+}
 $haveWin = ($winFrom -ne "" -or $winTo -ne "")
 
 Say ("Engine v" + $AppVersion + "  host=" + $HostLabel + "  iocs=" + $nIoc + "  budget=" + $RowBudget + "/set")
@@ -398,10 +407,23 @@ function RunTool([string]$args_, [string]$logName) {
     return $LASTEXITCODE
 }
 
+# reuse a cached CSV only when it is non-empty AND not older than the input artifact.
+# The output folder is keyed by hostname, so a re-collected host lands in the same
+# csv\ dir - without the mtime check a re-run would silently score last week's rows.
+# NB: bool-only return; a Say in here would join the return value (PS functions
+# return ALL pipeline output) and make every result truthy.
+function CsvFresh([string]$csv, [string]$src) {
+    if (-not (Test-Path -LiteralPath $csv)) { return $false }
+    $c = Get-Item -LiteralPath $csv
+    if ($c.Length -eq 0) { return $false }
+    return ($c.LastWriteTimeUtc -ge (Get-Item -LiteralPath $src).LastWriteTimeUtc)
+}
+
 if ($haveMft) {
-    if ((Test-Path -LiteralPath $mftCsv) -and ((Get-Item -LiteralPath $mftCsv).Length -gt 0)) {
+    if (CsvFresh $mftCsv $Mft) {
         Say ("[1/6] Reusing existing " + $mftCsv)
     } else {
+        if (Test-Path -LiteralPath $mftCsv) { Say "[1/6] Cached mft.csv is stale or empty (input is newer) - re-running MFTECmd." }
         Say "[1/6] Running MFTECmd on `$MFT ..."
         $rc = RunTool ("-f `"" + $Mft + "`" --csv `"" + $csvDir + "`" --csvf mft.csv") "mftecmd_mft.log"
         if ($rc -ne 0 -or -not (Test-Path -LiteralPath $mftCsv)) { Fail ("MFTECmd `$MFT parse failed (rc=" + $rc + ") - see " + (Join-Path $csvDir "mftecmd_mft.log")) }
@@ -410,9 +432,10 @@ if ($haveMft) {
     Say "[1/6] No `$MFT supplied - journal-only run (ParentPath will be unresolved)."
 }
 if ($haveJ) {
-    if ((Test-Path -LiteralPath $jCsv) -and ((Get-Item -LiteralPath $jCsv).Length -gt 0)) {
+    if (CsvFresh $jCsv $J) {
         Say ("[1/6] Reusing existing " + $jCsv)
     } else {
+        if (Test-Path -LiteralPath $jCsv) { Say "[1/6] Cached j.csv is stale or empty (input is newer) - re-running MFTECmd." }
         Say "[1/6] Running MFTECmd on `$J ..."
         # -m resolves ParentPath from the $MFT; drop it for a standalone journal parse.
         # (Verified 2026-07-07: J-only CSV keeps the same columns - ParentPath is just empty.)
@@ -451,7 +474,7 @@ try {
     $cInUse = ColIx $map "InUse";        $cPP  = ColIx $map "ParentPath"
     $cFN    = ColIx $map "FileName";     $cExt = ColIx $map "Extension"
     $cSize  = ColIx $map "FileSize";     $cDir = ColIx $map "IsDirectory"
-    $cAds   = ColIx $map "HasAds";       $cIsAds = ColIx $map "IsAds"
+    $cAds   = ColIx $map "HasAds"
     $cSiFn  = ColIx $map "SI<FN";        $cZone  = ColIx $map "ZoneIdContents"
     $cCr10  = ColIx $map "Created0x10";  $cCr30  = ColIx $map "Created0x30"
     $cMod10 = ColIx $map "LastModified0x10"; $cAcc10 = ColIx $map "LastAccess0x10"
@@ -787,7 +810,10 @@ function TakeInto([System.Collections.Generic.List[object[]]]$dst, [System.Colle
         if ($dst.Count -lt $budget) { $dst.Add($r) } else { $dropStats[$tier] = $dropStats[$tier] + 1 }
     }
 }
-TakeInto $mftKeep $t1m $RowBudget "t1" $mftDrop
+# t1 (IOC hits) is exempt from the budget - analyst-supplied known-bad is never
+# truncated (SPEC promise); a broad term can push kept counts past the budget,
+# which the reduction banner reports honestly.
+TakeInto $mftKeep $t1m ([int]::MaxValue) "t1" $mftDrop
 TakeInto $mftKeep $t2m $RowBudget "t2" $mftDrop
 TakeInto $mftKeep $t3m $RowBudget "t3" $mftDrop
 TakeInto $mftKeep $t4m $RowBudget "t4" $mftDrop
@@ -834,7 +860,7 @@ if ($haveJ) {
         [System.Array]::Reverse($items)
         $t6j.Clear(); foreach ($it in $items) { $t6j.Add($it) }
     }
-    TakeInto $jKeep $jt["t1"] $RowBudget "t1" $jDrop
+    TakeInto $jKeep $jt["t1"] ([int]::MaxValue) "t1" $jDrop   # IOC hits never truncated (see MFT note)
     TakeInto $jKeep $jt["t2"] $RowBudget "t2" $jDrop
     TakeInto $jKeep $jt["t3"] $RowBudget "t3" $jDrop
     TakeInto $jKeep $jt["t4"] $RowBudget "t4" $jDrop
@@ -941,7 +967,7 @@ foreach ($r in $jKeep) {
 [void]$sb.Append(']};')
 $dataJs = $sb.ToString()
 
-# --- Phase-1 stub viewer. Replaced wholesale by the full viewer in Phase 2.
+# --- Full interactive viewer template (authoritative copy; see splice-viewer.ps1).
 # [SCRIPT] / [/SCRIPT] tokens are swapped for real script tags at emit time so the
 # template can survive later embedding inside the HTA payload block.
 $TEMPLATE = @'
@@ -1040,6 +1066,7 @@ input[type=text]{width:170px} input.dt{width:98px}
   <input type="text" class="dt mono" id="d2" placeholder="to YYYY-MM-DD">
   <select id="extq"><option value="">ext: all</option><option>exe</option><option>dll</option><option>sys</option><option>ps1</option><option>bat</option><option>cmd</option><option>vbs</option><option>js</option><option>hta</option><option>jar</option><option>lnk</option><option>7z</option><option>zip</option><option>rar</option><option>iso</option></select>
   <input type="text" id="pscope" placeholder="path contains" style="width:130px">
+  <select id="userq" title="Filter to rows whose ParentPath sits in one user's profile (\Users\name\). Content, not the invoking account. Rows outside any profile group as (no user path)."><option value="">user: all</option></select>
   <button id="bClear">Clear</button>
   <button id="bIoc">IOC+</button>
   <button id="bCsv">Export CSV</button>
@@ -1071,23 +1098,42 @@ var M={E:0,SEQ:1,DEL:2,PP:3,FN:4,EXT:5,SIZE:6,DIR:7,ADS:8,ZONE:9,CR10:10,CR30:11
 var J={TS:0,NAME:1,EXT:2,ENT:3,SEQ:4,PP:5,UPD:6,ATTR:7,SC:8,TAGS:9,WHY:10};
 var ROWH=24, meta=DATA.meta;
 function $(id){return document.getElementById(id)}
-function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
+// NB: escapes BOTH quote styles - artifact filenames are attacker-controlled and land
+// in single-quoted title='...' attributes; an apostrophe must not break out of them
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function nfmt(n){return Number(n).toLocaleString()}
 function toast(t){var m=$("msg");m.textContent=t;m.style.display="block";setTimeout(function(){m.style.display="none"},2200)}
 
-// ---- one-time prep: lowercase search blobs + entry index
+// ---- user derived from ParentPath (\Users\<name>\; CONTENT, not the invoking account) - user filter
+// prepend a separator so relative (.\Users\..) and bare (Users\..) forms both match; blank/unresolved -> bucket
+function userFromParent(pp){ if(!pp) return "(no user path)"; var m=("\\"+pp).match(/[\\\/]users[\\\/]([^\\\/]+)/i); return m?m[1]:"(no user path)"; }
+
+// ---- one-time prep: lowercase search blobs + entry index + per-row user
 var mftBlob=new Array(DATA.mft.length), jBlob=new Array(DATA.j.length);
+var mftUser=new Array(DATA.mft.length), jUser=new Array(DATA.j.length), userSet={};
 var entryIdx={}; // "entry-seq" -> {m:mftIdx, j:[jIdx]}
 (function(){
   var i,r,k;
   for(i=0;i<DATA.mft.length;i++){r=DATA.mft[i];
     mftBlob[i]=(r[M.PP]+"\\"+r[M.FN]+"|"+r[M.EXT]+"|"+r[M.TAGS]+"|"+r[M.WHY]+"|"+r[M.ZONE]).toLowerCase();
+    mftUser[i]=userFromParent(r[M.PP]); userSet[mftUser[i]]=1;
     k=r[M.E]+"-"+r[M.SEQ]; if(!entryIdx[k])entryIdx[k]={m:-1,j:[]}; entryIdx[k].m=i;}
   for(i=0;i<DATA.j.length;i++){r=DATA.j[i];
     jBlob[i]=(r[J.PP]+"\\"+r[J.NAME]+"|"+r[J.EXT]+"|"+r[J.TAGS]+"|"+r[J.WHY]+"|"+r[J.UPD]).toLowerCase();
+    jUser[i]=userFromParent(r[J.PP]); userSet[jUser[i]]=1;
     k=r[J.ENT]+"-"+r[J.SEQ]; if(!entryIdx[k])entryIdx[k]={m:-1,j:[]}; entryIdx[k].j.push(i);}
 })();
 var adhocM={}, adhocJ={}, adhocOn=false;
+// populate the user dropdown; hide it when the set has 0-1 distinct users (nothing to isolate)
+function populateUsers(){
+  var sel=$("userq"); if(!sel) return;
+  var arr=[],k; for(k in userSet){ if(userSet.hasOwnProperty(k)) arr.push(k); }
+  arr.sort();
+  var h='<option value="">user: all</option>',i;
+  for(i=0;i<arr.length;i++) h+='<option value="'+esc(arr[i])+'">'+esc(arr[i])+'</option>';
+  sel.innerHTML=h; sel.style.display=(arr.length>1)?"":"none";
+}
+populateUsers();
 
 // ---- header pills / banner / footer
 $("pillGen").innerHTML="generated <b>"+esc(meta.generated)+"</b>";
@@ -1106,6 +1152,7 @@ $("pillVer").innerHTML="engine <b>"+esc(meta.appVersion)+"</b> &middot; MFTECmd 
 // ---- filter state (shared across views)
 var VIEW="ov", SORT={j:{k:J.SC,d:-1,k2:J.TS},m:{k:M.SC,d:-1,k2:M.CR10}};
 var TAGSEL="ALL";
+var USERFILTER="";   // selected user (userFromParent value; "" = all)
 var filtered=[];   // raw indexes into active dataset
 var TAGLIST=["SUS","IOC","IOCX","USERPATH","TIMESTOMP","ADS","DELETED","MASQ","DBLEXT","CRTDEL","BURST","RANDOM","LOLBIN","RECENT"];
 
@@ -1116,6 +1163,7 @@ function tsOf(r){return VIEW==="j"?r[J.TS]:r[M.CR10]}
 function tagsOf(r){return VIEW==="j"?r[J.TAGS]:r[M.TAGS]}
 function extOf(r){return VIEW==="j"?r[J.EXT]:r[M.EXT]}
 function ppOf(r){return VIEW==="j"?r[J.PP]:r[M.PP]}
+function userOf(i){return VIEW==="j"?jUser[i]:mftUser[i]}   // per-row user, indexed by dataset position
 function adhocSet(){return VIEW==="j"?adhocJ:adhocM}
 
 function hasTag(r,i,t){
@@ -1140,6 +1188,7 @@ function applyFilters(){
     if(ok&&d2&&tsOf(r)>d2)ok=false;
     if(ok&&ext&&extOf(r)!==ext)ok=false;
     if(ok&&ps&&(ppOf(r)+"").toLowerCase().indexOf(ps)<0)ok=false;
+    if(ok&&USERFILTER&&userOf(i)!==USERFILTER)ok=false;
     if(!ok)continue;
     counts.ALL++;
     for(t=0;t<TAGLIST.length;t++){if(hasTag(r,i,TAGLIST[t]))counts[TAGLIST[t]]++}
@@ -1180,7 +1229,8 @@ var COLS_J=[
  {h:"Name",w:230,g:function(r){return '<span class="mono">'+esc(r[J.NAME])+'</span>'},k:J.NAME},
  {h:"Parent path",w:430,g:function(r){return '<span class="mono">'+esc(r[J.PP])+'</span>'},k:J.PP},
  {h:"Update reasons",w:240,g:function(r){return esc(r[J.UPD])},k:J.UPD},
- {h:"Ext",w:48,g:function(r){return esc(r[J.EXT])},k:J.EXT}];
+ {h:"Ext",w:48,g:function(r){return esc(r[J.EXT])},k:J.EXT},
+ {h:"User",w:110,g:function(r,i){var u=jUser[i];return '<span class="lnk" data-user="'+esc(u)+'" title="click to filter">'+esc(u)+'</span>'},k:J.PP}];
 var COLS_M=[
  {h:"Score",w:52,g:function(r){return '<span class="sc">'+(r[M.SC]||"")+'</span>'},k:M.SC},
  {h:"Tags",w:180,g:function(r,i){return tagHtml(r[M.TAGS],adhocM[i])},k:M.SC},
@@ -1190,7 +1240,8 @@ var COLS_M=[
  {h:"Ext",w:48,g:function(r){return esc(r[M.EXT])},k:M.EXT},
  {h:"Size",w:90,g:function(r){return nfmt(r[M.SIZE])},k:M.SIZE},
  {h:"Del",w:40,g:function(r){return r[M.DEL]?"Y":""},k:M.DEL},
- {h:"ADS",w:44,g:function(r){return r[M.ADS]?"Y":""},k:M.ADS}];
+ {h:"ADS",w:44,g:function(r){return r[M.ADS]?"Y":""},k:M.ADS},
+ {h:"User",w:110,g:function(r,i){var u=mftUser[i];return '<span class="lnk" data-user="'+esc(u)+'" title="click to filter">'+esc(u)+'</span>'},k:M.PP}];
 function cols(){return VIEW==="j"?COLS_J:COLS_M}
 function tagHtml(t,adhoc){
   var o="",a,i; if(t){a=String(t).split("|");
@@ -1318,6 +1369,8 @@ function sizeGrid(){gw.style.height=Math.max(220,window.innerHeight-gw.getBoundi
 // ---- detail pane
 var selIdx=-1;
 rowsEl.onclick=function(e){
+  var u=e.target.closest("[data-user]");
+  if(u){USERFILTER=u.getAttribute("data-user");var sel=$("userq");if(sel)sel.value=USERFILTER;applyFilters();return;}
   var t=e.target.closest(".r"); if(!t)return;
   openDetail(VIEW,parseInt(t.dataset.ri,10));
 };
@@ -1421,7 +1474,9 @@ function renderOverview(){
   var idx=[];for(i=0;i<DATA.mft.length;i++)idx.push(i);
   idx.sort(function(a,b){var x=DATA.mft[a],y=DATA.mft[b];if(y[M.SC]!==x[M.SC])return y[M.SC]-x[M.SC];return y[M.CR10]<x[M.CR10]?-1:1});
   for(i=0;i<idx.length&&topM.length<12;i++){r=DATA.mft[idx[i]];if(r[M.SC]>=3)topM.push(idx[i]);else break}
-  for(i=0;i<idx.length&&topX.length<12;i++){r=DATA.mft[idx[i]];if(r[M.EXT]==="exe"||r[M.EXT]==="dll"||r[M.EXT]==="sys")topX.push(idx[i])}
+  // newest across ALL embedded executables (walking the score-sorted idx here let
+  // old-but-scored binaries displace genuinely newer score-0 ones)
+  for(i=0;i<DATA.mft.length;i++){r=DATA.mft[i];if(r[M.EXT]==="exe"||r[M.EXT]==="dll"||r[M.EXT]==="sys")topX.push(i)}
   topX.sort(function(a,b){return DATA.mft[b][M.CR10]<DATA.mft[a][M.CR10]?-1:1});topX=topX.slice(0,12);
   for(i=0;i<DATA.j.length;i++){r=DATA.j[i];if((r[J.UPD]+"").indexOf("FileCreate")>=0){dirs[r[J.PP]]=(dirs[r[J.PP]]||0)+1}}
   for(var d in dirs)dl.push([d,dirs[d]]); dl.sort(function(a,b){return b[1]-a[1]}); dl=dl.slice(0,12);
@@ -1469,8 +1524,9 @@ var deb=null;
 function refire(){if(VIEW==="ov")return;if(deb)clearTimeout(deb);deb=setTimeout(applyFilters,200)}
 $("q").oninput=refire; $("d1").oninput=refire; $("d2").oninput=refire;
 $("extq").onchange=function(){if(VIEW!=="ov")applyFilters()};
+$("userq").onchange=function(){USERFILTER=this.value;if(VIEW!=="ov")applyFilters()};
 $("pscope").oninput=refire;
-$("bClear").onclick=function(){$("q").value="";$("d1").value="";$("d2").value="";$("extq").value="";$("pscope").value="";TAGSEL="ALL";if(VIEW!=="ov")applyFilters()};
+$("bClear").onclick=function(){$("q").value="";$("d1").value="";$("d2").value="";$("extq").value="";$("pscope").value="";$("userq").value="";USERFILTER="";TAGSEL="ALL";if(VIEW!=="ov")applyFilters()};
 
 // ---- ad-hoc IOC
 $("bIoc").onclick=function(){var b=$("iocbox");b.style.display=(b.style.display==="block")?"none":"block"};
@@ -1491,11 +1547,13 @@ $("bIocGo").onclick=function(){
 $("bCsv").onclick=function(){
   if(VIEW==="ov"){toast("switch to Timeline or Files first");return}
   var rows=activeRows(),c=cols(),i,j,r,line,out=[],hd=[];
-  var names=VIEW==="j"?DATA.cols.j:DATA.cols.mft;
+  var names=(VIEW==="j"?DATA.cols.j:DATA.cols.mft).concat(["User"]);   // User is derived, not in the raw row -> synthesize
   out.push(names.join(","));
   for(i=0;i<filtered.length;i++){r=rows[filtered[i]];line=[];
     for(j=0;j<r.length;j++){var v=String(r[j]==null?"":r[j]);
       line.push(/[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v)}
+    var uv=String(userOf(filtered[i]));
+    line.push(/[",\n]/.test(uv)?'"'+uv.replace(/"/g,'""')+'"':uv);
     out.push(line.join(","))}
   var blob=new Blob([out.join("\r\n")],{type:"text/csv"});
   var a=document.createElement("a");a.href=URL.createObjectURL(blob);
@@ -1552,7 +1610,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.7.0";
+var APP_VERSION = "1.8.1";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1564,7 +1622,7 @@ var ENGINE_PS1 = "";                 // resolved path of the extracted engine on
 /* ---------- tiny helpers ---------- */
 function $(id){ return document.getElementById(id); }
 function esc(s){ if(s==null) return ""; s=String(s);
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
 function trimStr(s){ return String(s).replace(/^\s+|\s+$/g,""); }
 function setStatus(msg,cls){ var el=$("status"); el.innerHTML=esc(msg); el.className=cls||"muted"; }
 function appendLog(t){ var el=$("log"); if(el.getAttribute("data-ph")==="1"){ el.innerHTML=""; el.setAttribute("data-ph","0"); }
@@ -1731,13 +1789,18 @@ function verCmp(a,b){ a=verTuple(a); b=verTuple(b); var n=Math.max(a.length,b.le
   for(var i=0;i<n;i++){ var x=a[i]||0,y=b[i]||0; if(x!==y) return x<y?-1:1; } return 0; }
 function schemesComparable(a,b){ var am=parseInt(String(a).split(".")[0],10)||0, bm=parseInt(String(b).split(".")[0],10)||0;
   return (am>=2000)===(bm>=2000); }   /* CalVer(site) vs SemVer(exe banner) are not comparable — avoids a perpetual bogus update nag */
+/* ASYNC on purpose: a sync XHR stalled the whole UI ~9s at startup on an offline
+   analysis box. The pill shows local state immediately; the callback refreshes it
+   if/when the site answers. */
 function fetchLatest(){
   LATEST_VER=KNOWN_LATEST_MFTECMD; WEB_OK=false;
   try{ var x=new ActiveXObject("MSXML2.ServerXMLHTTP.6.0"); x.setTimeouts(2000,3000,4000,4000);
-    x.open("GET", MFTECMD_PAGE, false); x.send();
-    if(x.status===200){ WEB_OK=true; var t=x.responseText+""; var m=t.match(/MFTECmd[\s\S]{0,800}?(\d+\.\d+\.\d+(?:\.\d+)?)/i); if(m) LATEST_VER=m[1]; }
+    x.open("GET", MFTECMD_PAGE, true);
+    x.onreadystatechange=function(){ if(x.readyState!==4) return;
+      try{ if(x.status===200){ WEB_OK=true; var t=x.responseText+""; var m=t.match(/MFTECmd[\s\S]{0,800}?(\d+\.\d+\.\d+(?:\.\d+)?)/i); if(m) LATEST_VER=m[1]; } }catch(e2){}
+      updateVerPill(); };
+    x.send();
   }catch(e){ WEB_OK=false; }
-  return LATEST_VER;
 }
 /* exe pill: green=present/current, orange=comparable newer exists, grey=not found (downloaded on demand) */
 function updateVerPill(){
@@ -2071,7 +2134,7 @@ function init(){
     window.setTimeout(function(){
       var hits=findMfts(p);
       if(!hits.length){ setStatus("No $MFT found under "+p,"err"); return; }
-      // prefer the largest (the system volume); fill the first, report count
+      // fill the first hit and report the count (no size preference is applied)
       $("mftPath").value=hits[0];
       var g=guessJ(hits[0]); if(g) $("jPath").value=g;
       hostGuessFrom(hits[0]);
