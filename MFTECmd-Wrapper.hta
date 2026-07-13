@@ -1610,7 +1610,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.8.1";
+var APP_VERSION = "1.8.2";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1836,10 +1836,10 @@ function evaluateTooling(){
   if(found) checkVersion(); else LOCAL_VER="";
   fetchLatest(); updateVerPill();
 }
-function downloadLatest(){
+function downloadLatest(silent, done){   // silent: skip the confirms (unattended /auto); done(ok): fired after install
   var target=htaFolder()||EXE_DIR;
-  if(!target){ setStatus("Cannot determine the app folder to install into","err"); return; }
-  if(!confirm("Download MFTECmd (.NET 9 build) from:\n"+MFTECMD_ZIP_URL+"\n\nInstall next to this app into:\n"+target+"\n\nProceed?")) return;
+  if(!target){ setStatus("Cannot determine the app folder to install into","err"); if(done) done(false); return; }
+  if(!silent && !confirm("Download MFTECmd (.NET 9 build) from:\n"+MFTECMD_ZIP_URL+"\n\nInstall next to this app into:\n"+target+"\n\nProceed?")) return;
   setStatus("Downloading & installing MFTECmd…","muted");
   var tq=String(target).replace(/'/g,"''");
   var ps="$ErrorActionPreference='Stop';"
@@ -1859,9 +1859,24 @@ function downloadLatest(){
   try{
     var r=runBatSync(['powershell -NoProfile -ExecutionPolicy Bypass -Command "'+ps+'" > "__LOG__" 2>&1']);
     appendLog("--- MFTECmd download / install ---\n"+r.log);
-    if((r.log+"").indexOf("INSTALL_OK")>=0){ setStatus("MFTECmd installed to "+target,"ok"); evaluateTooling(); }
-    else setStatus("Download/install failed - see log","err");
+    if((r.log+"").indexOf("INSTALL_OK")>=0){ setStatus("MFTECmd installed to "+target,"ok"); evaluateTooling(); if(done) done(true); }
+    else { setStatus("Download/install failed - see log","err"); if(done) done(false); }
   }catch(e){ setStatus("Download failed: "+e.message,"err"); }
+}
+
+/* /auto launch: if the tool exe is missing, fetch it first and run in the install callback.
+   The Finder's Process / Process-all fires wrappers unattended, so a missing exe must self-resolve
+   rather than just erroring. Exe already present, or genuinely offline, falls straight through to the
+   normal run (the process function emits the existing clear "not found" message when offline). */
+function autoProcess(){
+  if(EXE && fileExists(EXE)){ processRun(); return; }
+  if(WEB_OK){
+    setStatus("MFTECmd.exe not present - downloading it before this auto run…","muted");
+    appendLog("/auto: MFTECmd.exe missing - fetching it before processing");
+    downloadLatest(true, function(ok){ if(ok) processRun(); });
+    return;
+  }
+  processRun();   // offline: let the process function surface the existing "not found" error
 }
 
 /* ---------- input guessing ---------- */
@@ -2225,7 +2240,7 @@ function applyCli(cli){ if(!cli.input) return false;
   }
   else { setStatus("CLI input not found: "+cli.input,"err"); appendLog("CLI input not found: "+cli.input); return false; }
   if(cli.outDir){ $("outDir").value=cli.outDir; OUT_TOUCHED=true; hostGuessFrom(cli.outDir); }
-  if(cli.auto){ appendLog("CLI: /auto — building report for "+cli.input); window.setTimeout(function(){ processRun(); },200); }
+  if(cli.auto){ appendLog("CLI: /auto — building report for "+cli.input); window.setTimeout(function(){ autoProcess(); },200); }
   else setStatus("CLI: input prefilled — click Run to build the report.","muted");
   return true; }
 
