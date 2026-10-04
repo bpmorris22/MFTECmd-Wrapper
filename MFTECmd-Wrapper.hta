@@ -459,12 +459,13 @@ else { Say "[2/6] No `$MFT supplied - file scoring skipped (journal-only report)
 $t1m = New-Object 'System.Collections.Generic.List[object[]]'   # IOC hits
 $t2m = New-Object 'System.Collections.Generic.List[object[]]'   # score >= 4
 $t3m = New-Object 'System.Collections.Generic.List[object[]]'   # score >= 2
-$t4m = New-Object 'System.Collections.Generic.List[object[]]'   # score >= 1
-$t5m = New-Object 'System.Collections.Generic.List[object[]]'   # in-window risky ext
-$t6m = New-Object 'System.Collections.Generic.List[object[]]'   # remainder (bounded, newest kept)
+$t4m = New-Object 'System.Collections.Generic.List[object[]]'   # score >= 1, not TIMESTOMP-only
+$t5m = New-Object 'System.Collections.Generic.List[object[]]'   # in case window, score <= 1, any ext (ranks above t4)
+$t6m = New-Object 'System.Collections.Generic.List[object[]]'   # remainder incl. TIMESTOMP-only (bounded, newest kept)
 $t6mMin = ""      # newest-N threshold: skip rows older than this once bounded
 $mftTotal = 0; $mftDel = 0; $mftAds = 0; $mftStomp = 0; $mftIoc = 0
 $maxTsM = ""
+$histM = @{}      # Created0x10 day -> record count (FULL set, pre-reduction) - the viewer's "N of M in window"
 
 if ($haveMft) {
 $srm = New-Object System.IO.StreamReader($mftCsv, [System.Text.Encoding]::UTF8, $true, 1MB)
@@ -501,6 +502,8 @@ try {
         if ($deleted) { $mftDel++ }
         if ($hasAds) { $mftAds++ }
         if ($cr10.CompareTo($maxTsM) -gt 0) { $maxTsM = $cr10 }
+        if ($cr10.Length -ge 10) { $dayM = $cr10.Substring(0,10)
+            if ($histM.ContainsKey($dayM)) { $histM[$dayM] = $histM[$dayM] + 1 } else { $histM[$dayM] = 1 } }
 
         $risky = ($extL.Length -gt 0 -and $RISKYEXT.ContainsKey($extL))
         $score = 0; $tags = ""; $why = ""
@@ -587,33 +590,36 @@ try {
                  $(if ($f[$cAcc10].Length -ge 19) { $f[$cAcc10].Substring(0,19) } else { $f[$cAcc10] }),
                  $score, $tags.TrimStart('|'), $why.TrimStart('; '))
 
+        # retention tiers (v1.9.4). TIMESTOMP alone (+1) is corroborating noise - 100k+ rows on a
+        # normal server - and it used to fill the whole budget at t4, so NO score-0 row and no
+        # case-window row was ever embedded: a date filter in the report then showed only a
+        # fraction of the files created in that window. TIMESTOMP-only rows now compete on recency
+        # with score-0 rows (t6), and with a case window every in-window row (any ext, score <= 1)
+        # ranks above the score-1 tier. Scores and tags are unchanged - only what gets embedded.
+        $ts = [string]$row[10]
+        $inWin = $false
+        if ($haveWin -and $ts -ne "") {
+            $inWin = $true
+            if ($winFrom -ne "" -and $ts.CompareTo($winFrom) -lt 0) { $inWin = $false }
+            if ($winTo -ne "" -and $ts.CompareTo($winTo) -gt 0) { $inWin = $false }
+        }
+        $stompOnly = ($score -eq 1 -and $tags -eq "|TIMESTOMP")
         if ($iocHit) { $t1m.Add($row) }
         elseif ($score -ge 4) { $t2m.Add($row) }
         elseif ($score -ge 2) { $t3m.Add($row) }
-        elseif ($score -ge 1) { $t4m.Add($row) }
-        else {
-            $ts = [string]$row[10]
-            $inWin = $false
-            if ($haveWin) {
-                $inWin = $true
-                if ($winFrom -ne "" -and $ts.CompareTo($winFrom) -lt 0) { $inWin = $false }
-                if ($winTo -ne "" -and $ts.CompareTo($winTo) -gt 0) { $inWin = $false }
-            }
-            if ($inWin -and $risky) { $t5m.Add($row) }
-            else {
-                # bounded newest-N remainder
-                if ($t6mMin -eq "" -or $ts.CompareTo($t6mMin) -ge 0) {
-                    $t6m.Add($row)
-                    if ($t6m.Count -ge ($RowBudget * 2)) {
-                        $keys = New-Object 'string[]' $t6m.Count
-                        $items = $t6m.ToArray()
-                        for ($k = 0; $k -lt $items.Length; $k++) { $keys[$k] = [string]$items[$k][10] }
-                        [System.Array]::Sort($keys, $items)          # ascending; newest at end
-                        $t6m.Clear()
-                        for ($k = $items.Length - $RowBudget; $k -lt $items.Length; $k++) { $t6m.Add($items[$k]) }
-                        $t6mMin = [string]$t6m[0][10]
-                    }
-                }
+        elseif ($inWin) { $t5m.Add($row) }
+        elseif ($score -ge 1 -and -not $stompOnly) { $t4m.Add($row) }
+        elseif ($t6mMin -eq "" -or $ts.CompareTo($t6mMin) -ge 0) {
+            # bounded newest-N remainder (score 0 + TIMESTOMP-only)
+            $t6m.Add($row)
+            if ($t6m.Count -ge ($RowBudget * 2)) {
+                $keys = New-Object 'string[]' $t6m.Count
+                $items = $t6m.ToArray()
+                for ($k = 0; $k -lt $items.Length; $k++) { $keys[$k] = [string]$items[$k][10] }
+                [System.Array]::Sort($keys, $items)          # ascending; newest at end
+                $t6m.Clear()
+                for ($k = $items.Length - $RowBudget; $k -lt $items.Length; $k++) { $t6m.Add($items[$k]) }
+                $t6mMin = [string]$t6m[0][10]
             }
         }
         if (($mftTotal % 200000) -eq 0) { Say ("      ... " + $mftTotal.ToString("N0") + " MFT rows") }
@@ -815,11 +821,28 @@ function TakeInto([System.Collections.Generic.List[object[]]]$dst, [System.Colle
 # t1 (IOC hits) is exempt from the budget - analyst-supplied known-bad is never
 # truncated (SPEC promise); a broad term can push kept counts past the budget,
 # which the reduction banner reports honestly.
+# order a tier so a PARTIAL take keeps the best rows: score (slot 14) desc when asked, then newest
+# Created0x10 (slot 10) first. A partial take used to walk t6 in its bounded-sort order, which is
+# OLDEST-first - the newest-N promise only held while t6 fit whole (the $J side already did this).
+function SortTier([System.Collections.Generic.List[object[]]]$lst, [bool]$byScore) {
+    if ($lst.Count -lt 2) { return }
+    $keys = New-Object 'string[]' $lst.Count
+    $items = $lst.ToArray()
+    for ($k = 0; $k -lt $items.Length; $k++) {
+        $pre = ""; if ($byScore) { $pre = ([int]$items[$k][14]).ToString("D3") + "|" }
+        $keys[$k] = $pre + [string]$items[$k][10]
+    }
+    [System.Array]::Sort($keys, $items, [System.StringComparer]::Ordinal)
+    [System.Array]::Reverse($items)
+    $lst.Clear(); $lst.AddRange($items)
+}
+SortTier $t5m $true      # a wide case window can overflow the budget: scored, then newest, first
+SortTier $t6m $false     # newest-first
 TakeInto $mftKeep $t1m ([int]::MaxValue) "t1" $mftDrop
 TakeInto $mftKeep $t2m $RowBudget "t2" $mftDrop
 TakeInto $mftKeep $t3m $RowBudget "t3" $mftDrop
+TakeInto $mftKeep $t5m $RowBudget "t5" $mftDrop   # case window ranks ABOVE score-1 (v1.9.4)
 TakeInto $mftKeep $t4m $RowBudget "t4" $mftDrop
-TakeInto $mftKeep $t5m $RowBudget "t5" $mftDrop
 # t6 already bounded; count anything beyond budget as dropped
 $t6drop = $mftTotal - $t1m.Count - $t2m.Count - $t3m.Count - $t4m.Count - $t5m.Count - $t6m.Count
 if ($t6drop -lt 0) { $t6drop = 0 }
@@ -929,6 +952,14 @@ foreach ($day in ($hist.Keys | Sort-Object)) {
     JsonStr $day $sb; [void]$sb.Append(':').Append([int]$hist[$day])
 }
 [void]$sb.Append('},')
+# full-$MFT Created0x10 per day (pre-reduction) - lets the viewer say "N of M in this window embedded"
+[void]$sb.Append('"mftHist":{')
+$first = $true
+foreach ($day in ($histM.Keys | Sort-Object)) {
+    if (-not $first) { [void]$sb.Append(',') }; $first = $false
+    JsonStr $day $sb; [void]$sb.Append(':').Append([int]$histM[$day])
+}
+[void]$sb.Append('},')
 
 [void]$sb.Append('"mft":[')
 $first = $true
@@ -993,6 +1024,7 @@ button{cursor:pointer} button:hover{border-color:var(--blu)}
 input[type=text]{width:170px} input.dt{width:98px}
 input.bad{border-color:var(--red);box-shadow:0 0 0 1px var(--red)}
 .winind{font-size:11.5px;color:var(--yel);margin-left:6px;align-self:center}
+.winind.miss{color:var(--red)}
 #tagbar{display:flex;flex-wrap:wrap;gap:4px;padding:4px 16px}
 .chip{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:1px 9px;font-size:11.5px;cursor:pointer;color:var(--mut)}
 .chip.on{border-color:var(--blu);color:var(--blu)}
@@ -1220,6 +1252,24 @@ function parseBound(s,isEnd){
   else { hh=+m[4]; mi=+m[5]; ss=(m[6]!=null)?+m[6]:(isEnd?59:0); if(hh>23||mi>59||ss>59) return null; }
   return m[1]+"-"+p2(mo)+"-"+p2(d)+" "+p2(hh)+":"+p2(mi)+":"+p2(ss);
 }
+// [min,max] non-blank timestamp of a view's embedded rows (the column the window filters), cached
+var SPAN={};
+function spanOf(v){
+  if(SPAN[v]) return SPAN[v];
+  var rows=(v==="j")?DATA.j:DATA.mft, ix=(v==="j")?J.TS:M.CR10, lo="", hi="", i, t;
+  for(i=0;i<rows.length;i++){ t=rows[i][ix]; if(!t) continue; if(!lo||t<lo) lo=t; if(!hi||t>hi) hi=t; }
+  return (SPAN[v]=[lo,hi]);
+}
+// rows in the window across the FULL (pre-reduction) set, from the engine's per-day counts:
+// DATA.hist = whole $J, DATA.mftHist = whole $MFT by Created 0x10 (absent before v1.9.4 -> null).
+// Day granularity, so exact only when both bounds fall on whole days.
+function fullInWindow(v){
+  var h=(v==="j")?DATA.hist:DATA.mftHist, a, b, n=0, k;
+  if(!h) return null;
+  a=DWIN.from?DWIN.from.substring(0,10):""; b=DWIN.to?DWIN.to.substring(0,10):"";
+  for(k in h){ if(!h.hasOwnProperty(k)||k.length!==10) continue; if(a&&k<a) continue; if(b&&k>b) continue; n+=h[k]; }
+  return {n:n, exact:(!DWIN.from||DWIN.from.substring(11)==="00:00:00")&&(!DWIN.to||DWIN.to.substring(11)==="23:59:59")};
+}
 function readDates(){
   var e1=$("d1"), e2=$("d2"), a=parseBound(e1.value,false), b=parseBound(e2.value,true);
   var rev=(a&&b&&a>b);
@@ -1238,13 +1288,13 @@ function applyFilters(){
   readDates();
   var d1=DWIN.from, d2=DWIN.to, ts;
   var ext=$("extq").value, ps=$("pscope").value.trim().toLowerCase();
-  var i,r,ok,t;
+  var i,r,ok,t,nWin=0;   // nWin: embedded rows in the window, before the other filters
   for(t=0;t<TAGLIST.length;t++)counts[TAGLIST[t]]=0;
   for(i=0;i<rows.length;i++){r=rows[i];
     ok=true;
-    if(q&&blob[i].indexOf(q)<0)ok=false;
-    if(ok&&(d1||d2)){ts=tsOf(r);   // a row with no timestamp is outside any window
-      if(!ts||(d1&&ts<d1)||(d2&&ts>d2))ok=false;}
+    if(d1||d2){ts=tsOf(r);   // a row with no timestamp is outside any window
+      if(!ts||(d1&&ts<d1)||(d2&&ts>d2))ok=false; else nWin++;}
+    if(ok&&q&&blob[i].indexOf(q)<0)ok=false;
     if(ok&&ext&&extKey(extOf(r))!==ext)ok=false;
     if(ok&&ps&&(ppOf(r)+"").toLowerCase().indexOf(ps)<0)ok=false;
     if(ok&&USERFILTER&&userOf(i)!==USERFILTER)ok=false;
@@ -1255,7 +1305,7 @@ function applyFilters(){
   }
   filtered=out;
   sortNow();
-  renderTagbar(counts);
+  renderTagbar(counts,nWin);
   layoutGrid();
 }
 function sortNow(){
@@ -1267,15 +1317,30 @@ function sortNow(){
     if(x<y)return 1; if(x>y)return -1; return 0;
   });
 }
-function renderTagbar(counts){
+function renderTagbar(counts,nWin){
   var h='<span class="chip'+(TAGSEL==="ALL"?" on":"")+'" data-t="ALL">ALL <b>'+nfmt(counts.ALL)+'</b></span>',t,n;
   for(var i=0;i<TAGLIST.length;i++){t=TAGLIST[i];n=counts[t]||0;
     if(t==="IOCX"&&!adhocOn)continue;
     h+='<span class="chip'+(TAGSEL===t?" on":"")+(n?"":" zero")+'" data-t="'+t+'">'+(t==="IOCX"?"IOC+":t)+' <b>'+nfmt(n)+'</b></span>';}
   // say which window is in force and on which column - with the default score-first sort an
-  // end date rarely changes the top rows, so the count + this line are the visible feedback
-  if(DWIN.from||DWIN.to)h+='<span class="winind mono">window '+esc(DWIN.from||"(open)")+' .. '+esc(DWIN.to||"(open)")+
-    ' UTC on '+(VIEW==="j"?"USN timestamp":"Created 0x10")+'</span>';
+  // end date rarely changes the top rows, so the count + this line are the visible feedback.
+  // Also show the span the view's rows actually cover: a small $J often holds only hours of
+  // activity, and a window outside it gives ALL 0, which otherwise reads as a broken filter.
+  // And say whether the window is COMPLETE: the report embeds a budgeted subset, so compare the
+  // embedded rows in the window with the full set's count (only N of M -> the rest are in the CSV).
+  if(DWIN.from||DWIN.to){
+    var sp=spanOf(VIEW), miss=!!sp[0]&&((DWIN.to&&DWIN.to<sp[0])||(DWIN.from&&DWIN.from>sp[1]));
+    var all=(VIEW==="j")?(meta.jKept>=meta.jTotal):(meta.mftKept>=meta.mftTotal), fw=fullInWindow(VIEW), emb="", part=false;
+    nWin=nWin||0;
+    if(all) emb=nfmt(nWin)+" in window - every row of this view is embedded";
+    else if(fw&&fw.exact){ if(nWin>=fw.n) emb="all "+nfmt(fw.n)+" in window embedded";
+      else { part=true; emb="only "+nfmt(nWin)+" of "+nfmt(fw.n)+" in window embedded - the rest are only in the full CSV"; } }
+    else if(fw) emb=nfmt(nWin)+" in window embedded (its whole days hold "+nfmt(fw.n)+" in the full set)";
+    var bits=["window "+esc(DWIN.from||"(open)")+" .. "+esc(DWIN.to||"(open)")+" UTC on "+(VIEW==="j"?"USN timestamp":"Created 0x10")];
+    if(miss) bits.push("NO OVERLAP - this view spans "+esc(sp[0])+" .. "+esc(sp[1]));
+    else { if(emb) bits.push(emb); if(sp[0]) bits.push("view spans "+esc(sp[0])+" .. "+esc(sp[1])); }
+    h+='<span class="winind mono'+((miss||part)?' miss':'')+'">'+bits.join(" &middot; ")+'</span>';
+  }
   $("tagbar").innerHTML=h;
 }
 $("tagbar").onclick=function(e){
@@ -1674,7 +1739,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.9.3";
+var APP_VERSION = "1.9.4";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
