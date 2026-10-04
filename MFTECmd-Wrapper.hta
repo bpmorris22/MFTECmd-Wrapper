@@ -60,6 +60,8 @@
   header h1{display:inline-block;font-size:15px;margin:0;font-weight:600;vertical-align:middle}
   header h1 small{color:#8b949e;font-weight:400}
   .pill{display:inline-block;font-size:11px;color:#8b949e;border:1px solid #30363d;border-radius:20px;padding:2px 10px;margin-left:8px;vertical-align:middle}
+  .pill.run{color:#ff8b3d;border-color:#bd561d}     /* orange: a run is in progress */
+  .pill.err{color:#ff8b8b;border-color:#b02020}     /* red: the run timed out / produced nothing */
   .pill.ok{color:#7ee787;border-color:#2ea043}
   .pill.bad{color:#ff8b3d;border-color:#bd561d}
   .wrap{padding:12px 14px}
@@ -91,6 +93,7 @@
   <span class="pill" id="verpill" title="MFTECmd.exe version">MFTECmd: checking&hellip;</span>
   <span class="pill" id="modepill">launcher</span>
   <span style="float:right">
+    <span class="pill" id="procTimer" title="Processing time. Starts when a run begins and stops when it finishes, so you can see how long the artifact actually took to parse. The app is single-threaded, so the counter can pause during a heavy step (a multi-GB parse, a hive replay) and then jump forward - that is the step blocking, not a stall." style="min-width:150px;text-align:center;display:inline-block">Idle</span>
     <button class="btn" id="instrBtn" onclick="openInstructions()" title="Download the latest HTML field guide from GitHub and open it in your browser">Instructions</button>
     <button class="btn" id="helpBtn" onclick="openHelp()" title="Help, about &amp; GitHub link">Help</button>
     <button class="btn primary hide" id="selfUpd" onclick="doSelfUpdate()" title="A newer version is available on GitHub">Update</button>
@@ -989,6 +992,8 @@ a{color:var(--blu)}
 button,select,input{background:var(--panel);border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit}
 button{cursor:pointer} button:hover{border-color:var(--blu)}
 input[type=text]{width:170px} input.dt{width:98px}
+input.bad{border-color:var(--red);box-shadow:0 0 0 1px var(--red)}
+.winind{font-size:11.5px;color:var(--yel);margin-left:6px;align-self:center}
 #tagbar{display:flex;flex-wrap:wrap;gap:4px;padding:4px 16px}
 .chip{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:1px 9px;font-size:11.5px;cursor:pointer;color:var(--mut)}
 .chip.on{border-color:var(--blu);color:var(--blu)}
@@ -1062,9 +1067,9 @@ input[type=text]{width:170px} input.dt{width:98px}
   <span class="tab" id="tabJ">Timeline ($J)</span>
   <span class="tab" id="tabM">Files ($MFT)</span>
   <input type="text" id="q" placeholder="search name / path / tags">
-  <input type="text" class="dt mono" id="d1" placeholder="from YYYY-MM-DD">
-  <input type="text" class="dt mono" id="d2" placeholder="to YYYY-MM-DD">
-  <select id="extq"><option value="">ext: all</option><option>exe</option><option>dll</option><option>sys</option><option>ps1</option><option>bat</option><option>cmd</option><option>vbs</option><option>js</option><option>hta</option><option>jar</option><option>lnk</option><option>7z</option><option>zip</option><option>rar</option><option>iso</option></select>
+  <input type="text" class="dt mono" id="d1" placeholder="from YYYY-MM-DD" title="Start of window (UTC, inclusive): YYYY-MM-DD [HH:MM[:SS]]">
+  <input type="text" class="dt mono" id="d2" placeholder="to YYYY-MM-DD" title="End of window (UTC, inclusive - a bare date runs to 23:59:59): YYYY-MM-DD [HH:MM[:SS]]">
+  <select id="extq" title="Every extension present in the active view's embedded rows (count in brackets). (none) = no extension."><option value="">ext: all</option></select>
   <input type="text" id="pscope" placeholder="path contains" style="width:130px">
   <select id="userq" title="Filter to rows whose ParentPath sits in one user's profile (\Users\name\). Content, not the invoking account. Rows outside any profile group as (no user path)."><option value="">user: all</option></select>
   <button id="bClear">Clear</button>
@@ -1107,20 +1112,29 @@ function toast(t){var m=$("msg");m.textContent=t;m.style.display="block";setTime
 // ---- user derived from ParentPath (\Users\<name>\; CONTENT, not the invoking account) - user filter
 // prepend a separator so relative (.\Users\..) and bare (Users\..) forms both match; blank/unresolved -> bucket
 function userFromParent(pp){ if(!pp) return "(no user path)"; var m=("\\"+pp).match(/[\\\/]users[\\\/]([^\\\/]+)/i); return m?m[1]:"(no user path)"; }
+// ---- extension key for the ext filter: engine emits lowercase, no dot; "" (no extension)
+// maps to "." - never a real value, so it can't collide with "ext: all" ("")
+var EXT_NONE=".";
+function extKey(e){ e=(e==null?"":String(e)); return e===""?EXT_NONE:e; }
 
 // ---- one-time prep: lowercase search blobs + entry index + per-row user
 var mftBlob=new Array(DATA.mft.length), jBlob=new Array(DATA.j.length);
 var mftUser=new Array(DATA.mft.length), jUser=new Array(DATA.j.length), userSet={};
 var entryIdx={}; // "entry-seq" -> {m:mftIdx, j:[jIdx]}
+// per-view extension -> embedded row count (feeds the ext dropdown). Prototype-less maps:
+// extensions are attacker-controlled, so "x.constructor" / "x.__proto__" must stay plain keys
+var extCnt={m:Object.create(null),j:Object.create(null)};
 (function(){
   var i,r,k;
   for(i=0;i<DATA.mft.length;i++){r=DATA.mft[i];
     mftBlob[i]=(r[M.PP]+"\\"+r[M.FN]+"|"+r[M.EXT]+"|"+r[M.TAGS]+"|"+r[M.WHY]+"|"+r[M.ZONE]).toLowerCase();
     mftUser[i]=userFromParent(r[M.PP]); userSet[mftUser[i]]=1;
+    k=extKey(r[M.EXT]); extCnt.m[k]=(extCnt.m[k]||0)+1;
     k=r[M.E]+"-"+r[M.SEQ]; if(!entryIdx[k])entryIdx[k]={m:-1,j:[]}; entryIdx[k].m=i;}
   for(i=0;i<DATA.j.length;i++){r=DATA.j[i];
     jBlob[i]=(r[J.PP]+"\\"+r[J.NAME]+"|"+r[J.EXT]+"|"+r[J.TAGS]+"|"+r[J.WHY]+"|"+r[J.UPD]).toLowerCase();
     jUser[i]=userFromParent(r[J.PP]); userSet[jUser[i]]=1;
+    k=extKey(r[J.EXT]); extCnt.j[k]=(extCnt.j[k]||0)+1;
     k=r[J.ENT]+"-"+r[J.SEQ]; if(!entryIdx[k])entryIdx[k]={m:-1,j:[]}; entryIdx[k].j.push(i);}
 })();
 var adhocM={}, adhocJ={}, adhocOn=false;
@@ -1134,6 +1148,22 @@ function populateUsers(){
   sel.innerHTML=h; sel.style.display=(arr.length>1)?"":"none";
 }
 populateUsers();
+// populate the ext dropdown from the extensions actually present in a view's embedded rows
+// (alphabetical so select type-ahead works; "(none)" last). A selection the new view lacks
+// is kept with a 0 count so the filter stays visible instead of silently resetting.
+function populateExts(v){
+  var sel=$("extq"); if(!sel) return;
+  var cnt=extCnt[v==="j"?"j":"m"], cur=sel.value, arr=[], k, i, h, hasCur=false;
+  for(k in cnt){ if(k!==EXT_NONE) arr.push(k); }
+  arr.sort();
+  if(cnt[EXT_NONE]) arr.push(EXT_NONE);
+  h='<option value="">ext: all ('+nfmt(arr.length)+')</option>';
+  for(i=0;i<arr.length;i++){ if(arr[i]===cur) hasCur=true;
+    h+='<option value="'+esc(arr[i])+'">'+(arr[i]===EXT_NONE?"(none)":esc(arr[i]))+' ('+nfmt(cnt[arr[i]])+')</option>'; }
+  if(cur&&!hasCur) h+='<option value="'+esc(cur)+'">'+(cur===EXT_NONE?"(none)":esc(cur))+' (0)</option>';
+  sel.innerHTML=h; sel.value=cur;
+}
+populateExts("m");
 
 // ---- header pills / banner / footer
 $("pillGen").innerHTML="generated <b>"+esc(meta.generated)+"</b>";
@@ -1173,20 +1203,50 @@ function hasTag(r,i,t){
   return (tagsOf(r)+"").indexOf(t)>=0;
 }
 
+// ---- date window: the bounds are string-compared against 'yyyy-MM-dd HH:mm:ss', so the typed
+// text MUST be normalised first. Raw compare made any non-ISO entry fail silently - an end of
+// "2026/9/10", "2026-9-10" or "10/09/2026" kept EVERY row (looked like "end date doesn't
+// filter"); a slashed start dropped every row. Accept Y-M-D with - / . separators, unpadded
+// month/day, optional [ T]HH:MM[:SS]; anything else (incl. ambiguous day-first dates) is
+// outlined red and IGNORED until fixed.
+var DWIN={from:"",to:""};   // normalised bounds in force ("" = open)
+function p2(n){return (n<10?"0":"")+n}
+function parseBound(s,isEnd){
+  s=String(s==null?"":s).trim(); if(!s) return "";
+  var m=s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if(!m) return null;
+  var mo=+m[2], d=+m[3], hh, mi, ss;
+  if(mo<1||mo>12||d<1||d>new Date(Date.UTC(+m[1],mo,0)).getUTCDate()) return null;
+  if(m[4]==null){ hh=isEnd?23:0; mi=isEnd?59:0; ss=isEnd?59:0; }
+  else { hh=+m[4]; mi=+m[5]; ss=(m[6]!=null)?+m[6]:(isEnd?59:0); if(hh>23||mi>59||ss>59) return null; }
+  return m[1]+"-"+p2(mo)+"-"+p2(d)+" "+p2(hh)+":"+p2(mi)+":"+p2(ss);
+}
+function readDates(){
+  var e1=$("d1"), e2=$("d2"), a=parseBound(e1.value,false), b=parseBound(e2.value,true);
+  var rev=(a&&b&&a>b);
+  e1.classList.toggle("bad",a===null); e2.classList.toggle("bad",b===null||!!rev);
+  e1.title=(a===null)?"Not a recognised date - use YYYY-MM-DD [HH:MM[:SS]] (UTC). Ignored until fixed."
+    :"Start of window (UTC, inclusive): YYYY-MM-DD [HH:MM[:SS]]";
+  e2.title=(b===null)?"Not a recognised date - use YYYY-MM-DD [HH:MM[:SS]] (UTC). Ignored until fixed."
+    :rev?"End is before start - the window is empty."
+    :"End of window (UTC, inclusive - a bare date runs to 23:59:59): YYYY-MM-DD [HH:MM[:SS]]";
+  DWIN.from=a||""; DWIN.to=b||"";
+}
+
 function applyFilters(){
   var rows=activeRows(), blob=activeBlob(), out=[], counts={ALL:0};
   var q=$("q").value.trim().toLowerCase();
-  var d1=$("d1").value.trim(), d2=$("d2").value.trim();
-  if(d1)d1+=" 00:00:00"; if(d2)d2+=" 23:59:59";
+  readDates();
+  var d1=DWIN.from, d2=DWIN.to, ts;
   var ext=$("extq").value, ps=$("pscope").value.trim().toLowerCase();
   var i,r,ok,t;
   for(t=0;t<TAGLIST.length;t++)counts[TAGLIST[t]]=0;
   for(i=0;i<rows.length;i++){r=rows[i];
     ok=true;
     if(q&&blob[i].indexOf(q)<0)ok=false;
-    if(ok&&d1&&tsOf(r)<d1)ok=false;
-    if(ok&&d2&&tsOf(r)>d2)ok=false;
-    if(ok&&ext&&extOf(r)!==ext)ok=false;
+    if(ok&&(d1||d2)){ts=tsOf(r);   // a row with no timestamp is outside any window
+      if(!ts||(d1&&ts<d1)||(d2&&ts>d2))ok=false;}
+    if(ok&&ext&&extKey(extOf(r))!==ext)ok=false;
     if(ok&&ps&&(ppOf(r)+"").toLowerCase().indexOf(ps)<0)ok=false;
     if(ok&&USERFILTER&&userOf(i)!==USERFILTER)ok=false;
     if(!ok)continue;
@@ -1213,6 +1273,10 @@ function renderTagbar(counts){
   for(var i=0;i<TAGLIST.length;i++){t=TAGLIST[i];n=counts[t]||0;
     if(t==="IOCX"&&!adhocOn)continue;
     h+='<span class="chip'+(TAGSEL===t?" on":"")+(n?"":" zero")+'" data-t="'+t+'">'+(t==="IOCX"?"IOC+":t)+' <b>'+nfmt(n)+'</b></span>';}
+  // say which window is in force and on which column - with the default score-first sort an
+  // end date rarely changes the top rows, so the count + this line are the visible feedback
+  if(DWIN.from||DWIN.to)h+='<span class="winind mono">window '+esc(DWIN.from||"(open)")+' .. '+esc(DWIN.to||"(open)")+
+    ' UTC on '+(VIEW==="j"?"USN timestamp":"Created 0x10")+'</span>';
   $("tagbar").innerHTML=h;
 }
 $("tagbar").onclick=function(e){
@@ -1512,6 +1576,7 @@ function setView(v){
   $("gridwrap").style.display=(v==="ov")?"none":"block";
   $("tagbar").style.display=(v==="ov")?"none":"flex";
   if(v==="ov"){renderOverview();return}
+  populateExts(v);
   if(v==="j"&&!DATA.j.length){toast("no $J data in this report")}
   renderHead(); sizeGrid(); gw.scrollTop=0; lastFirst=-1; applyFilters();
 }
@@ -1521,12 +1586,12 @@ $("tabM").onclick=function(){setView("m")};
 
 // ---- filter inputs
 var deb=null;
-function refire(){if(VIEW==="ov")return;if(deb)clearTimeout(deb);deb=setTimeout(applyFilters,200)}
+function refire(){readDates();if(VIEW==="ov")return;if(deb)clearTimeout(deb);deb=setTimeout(applyFilters,200)}
 $("q").oninput=refire; $("d1").oninput=refire; $("d2").oninput=refire;
 $("extq").onchange=function(){if(VIEW!=="ov")applyFilters()};
 $("userq").onchange=function(){USERFILTER=this.value;if(VIEW!=="ov")applyFilters()};
 $("pscope").oninput=refire;
-$("bClear").onclick=function(){$("q").value="";$("d1").value="";$("d2").value="";$("extq").value="";$("pscope").value="";$("userq").value="";USERFILTER="";TAGSEL="ALL";if(VIEW!=="ov")applyFilters()};
+$("bClear").onclick=function(){$("q").value="";$("d1").value="";$("d2").value="";$("extq").value="";$("pscope").value="";$("userq").value="";USERFILTER="";TAGSEL="ALL";readDates();if(VIEW!=="ov")applyFilters()};
 
 // ---- ad-hoc IOC
 $("bIoc").onclick=function(){var b=$("iocbox");b.style.display=(b.style.display==="block")?"none":"block"};
@@ -1610,7 +1675,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.8.2";
+var APP_VERSION = "1.9.1";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1632,6 +1697,34 @@ function setLog(t){ var el=$("log"); el.setAttribute("data-ph","0"); el.style.di
 function uid(){ return new Date().getTime()+""+Math.floor(Math.random()*100000); }
 function fileExists(p){ try{ return new ActiveXObject("Scripting.FileSystemObject").FileExists(p); }catch(e){ return false; } }
 function folderExists(p){ try{ return new ActiveXObject("Scripting.FileSystemObject").FolderExists(p); }catch(e){ return false; } }
+/* ---------- long paths (MAX_PATH, family 2026-10-03) ----------
+   mshta is not long-path aware: plain FSO FileExists / FolderExists / GetFolder report a path of 260+ characters
+   as missing even when it exists (VERIFIED 2026-10-03, Win11 + LongPathsEnabled=1: 259 chars seen, 260 not), and
+   Velociraptor / KAPE collection paths routinely exceed that. The same FSO calls DO see such a path through its
+   \\?\ extended-length form, so a long path is re-checked that way (lpKind). An operator-given input that even the
+   \\?\ form cannot see is still trusted: a note is logged and the long-path-aware engine reports a genuine miss -
+   an FSO miss on a long path is never treated as authoritative. */
+var MAXP=259;
+function isLongPath(p){ return String(p||"").length>MAXP; }
+function lpForm(p){ p=String(p||"").replace(/\//g,"\\");
+  if(/^[A-Za-z]:\\/.test(p)) return "\\\\?\\"+p;
+  if(/^\\\\[^\\?.]/.test(p)) return "\\\\?\\UNC\\"+p.substring(2);
+  return ""; }
+function lpKind(p){ var q=lpForm(p); if(!q) return "";   // "f" file / "d" folder / "" not seen, through the \\?\ form
+  try{ var fso=new ActiveXObject("Scripting.FileSystemObject"); if(fso.FileExists(q)) return "f"; if(fso.FolderExists(q)) return "d"; }catch(e){}
+  return ""; }
+function inputSeen(p, wantDir, what){
+  if(wantDir ? folderExists(p) : fileExists(p)) return true;
+  if(!isLongPath(p)) return false;
+  var k=lpKind(p);
+  if(k && k!==(wantDir?"d":"f")) return false;   // it exists, but as the other kind
+  appendLog("Note: the "+what+" path is "+String(p).length+" characters (over MAX_PATH) - "+(k
+    ? "verified through its \\\\?\\ extended-length form."
+    : "this app cannot verify it; the engine reads it and reports it if it is really missing: "+p));
+  return true; }
+function fileSeen(p){ return fileExists(p) || (isLongPath(p) && lpKind(p)==="f"); }   // verified only - for sibling guesses, never trusted blind
+function unLp(p){ p=String(p||"").replace(/^\\\\\?\\UNC\\/i,"\\\\").replace(/^\\\\\?\\/,"");   // back to the plain path (engine args, runinfo, display)
+  return /^[a-z]:/.test(p) ? p.charAt(0).toUpperCase()+p.substring(1) : p; }   // FSO lowercases the drive letter of a \\?\ path
 function parentDir(p){ var i=String(p).lastIndexOf("\\"); return i>=0?p.substring(0,i):p; }
 function baseName(p){ if(!p) return ""; p=String(p); var i=Math.max(p.lastIndexOf("\\"),p.lastIndexOf("/")); return i>=0?p.substring(i+1):p; }
 /* cmd expands %VAR% inside .bat FILE lines even in quotes - double them there only */
@@ -1659,6 +1752,34 @@ function readText(path){
 }
 /* the PS1 payload is pure ASCII - write it with FSO (ANSI) which is exactly right and zone-immune */
 function writeAscii(path,text){ var fso=new ActiveXObject("Scripting.FileSystemObject"); var f=fso.CreateTextFile(path,true,false); f.Write(text); f.Close(); }
+
+/* ---------- processing-time pill (ported from vSphere Support Bundle Analyzer) ----------
+   A long parse used to read as a hang: the status line ticks, but nothing said how long the run had
+   taken or how long the previous one took. #procTimer lives in the header and holds three states -
+   Idle, an orange live counter while the tool runs, and a final green "Processing time mm:ss" (red
+   if the watchdog gave up waiting). The HTA is single-threaded, so the counter can freeze during a
+   blocking step and then jump; the pill tooltip says so rather than letting it look broken. */
+var PROC_T0=0, PROC_TIMER=null, PROC_WHAT="Processing";
+function procFmt(s){ var m=Math.floor(s/60), ss=s%60; return (m<10?"0":"")+m+":"+(ss<10?"0":"")+ss; }
+function procStart(what){
+  PROC_WHAT=what||"Processing";
+  PROC_T0=(new Date()).getTime();
+  if(PROC_TIMER) window.clearInterval(PROC_TIMER);
+  PROC_TIMER=window.setInterval(procTick,500);
+  var el=$("procTimer"); if(el){ el.className="pill run"; el.innerHTML=PROC_WHAT+" 00:00"; }
+}
+function procTick(){ if(!PROC_T0) return; var el=$("procTimer"); if(!el) return;
+  el.innerHTML=PROC_WHAT+" "+procFmt(Math.floor(((new Date()).getTime()-PROC_T0)/1000)); }
+function procStop(ok){
+  if(PROC_TIMER){ window.clearInterval(PROC_TIMER); PROC_TIMER=null; }
+  if(!PROC_T0) return;
+  var s=Math.floor(((new Date()).getTime()-PROC_T0)/1000), el=$("procTimer");
+  if(el){ el.className=(ok===false?"pill err":"pill ok"); el.innerHTML="Processing time "+procFmt(s); }
+  PROC_T0=0;
+}
+/* the run finished but produced nothing usable - recolour the stopped pill so the header agrees
+   with the error in the status line instead of showing a reassuring green time. */
+function procFail(){ var el=$("procTimer"); if(el && !PROC_T0) el.className="pill err"; }
 
 /* ---------- async batch runner (family runBatAsync/pollDone) ---------- */
 function runBatAsync(lines, show){
@@ -1725,11 +1846,12 @@ function pollDone(ctx){
     try{ fso.DeleteFile(ctx.bat); }catch(e1){}
     try{ if(fso.FileExists(ctx.done)) fso.DeleteFile(ctx.done); }catch(e2){}
     try{ if(fso.FileExists(ctx.log)) fso.DeleteFile(ctx.log); }catch(e3){}
+    if(ctx.procTimed) procStop(true);
     ctx.onDone(log, (stable&&!done)?"stable":"marker");
     return;
   }
   ctx.elapsed+=1;
-  if(ctx.elapsed>2400){ ctx.onTimeout&&ctx.onTimeout(); return; }   // 40-min cap (MFT parse can be minutes)
+  if(ctx.elapsed>2400){ if(ctx.procTimed) procStop(false); ctx.onTimeout&&ctx.onTimeout(); return; }   // 40-min cap (MFT parse can be minutes)
   if(ctx.onTick) ctx.onTick(ctx.elapsed);
   window.setTimeout(function(){ pollDone(ctx); }, 1000);
 }
@@ -1891,7 +2013,7 @@ function guessJ(mft){
     root+"\\$Extend\\$J",
     root+"\\$J"
   ];
-  for(var i=0;i<cands.length;i++){ try{ if(fso.FileExists(cands[i])) return cands[i]; }catch(e){} }
+  for(var i=0;i<cands.length;i++){ try{ if(fileSeen(cands[i])) return cands[i]; }catch(e){} }
   return "";
 }
 /* v1.5.0: a collected USN journal is named "$UsnJrnl%3A$J" (Velociraptor keeps the literal %3A
@@ -1908,7 +2030,7 @@ function guessMft(j){
   var p1=parentDir(j);              // ...\$Extend  (or the flat export dir)
   var p2=parentDir(p1);             // ...\<vol>
   var cands=[ p2+"\\$MFT", p1+"\\$MFT" ];
-  for(var i=0;i<cands.length;i++){ try{ if(fso.FileExists(cands[i])) return cands[i]; }catch(e){} }
+  for(var i=0;i<cands.length;i++){ try{ if(fileSeen(cands[i])) return cands[i]; }catch(e){} }
   return "";
 }
 /* pull a hostname-ish token out of a Velociraptor collection path, a _Processed\<host>\ path,
@@ -1930,11 +2052,11 @@ function findMfts(root){
     MFT_DIRS++;
     try{ var fe=new Enumerator(fld.Files);
       for(;!fe.atEnd();fe.moveNext()){ var f=fe.item();
-        if(String(f.Name).toUpperCase()==="$MFT"){ out.push(f.Path+""); if(out.length>=MFT_MAX) return; } } }catch(e1){}
+        if(String(f.Name).toUpperCase()==="$MFT"){ out.push(unLp(f.Path+"")); if(out.length>=MFT_MAX) return; } } }catch(e1){}
     try{ var de=new Enumerator(fld.SubFolders);
       for(;!de.atEnd();de.moveNext()){ walk(de.item(),depth+1); if(out.length>=MFT_MAX) return; } }catch(e2){}
   }
-  try{ walk(fso.GetFolder(root),0); }catch(e){}
+  try{ walk(fso.GetFolder(lpForm(root)||root),0); }catch(e){ try{ walk(fso.GetFolder(root),0); }catch(e3){} }   // \\?\ form: a $MFT deeper than MAX_PATH is found too
   return out;
 }
 
@@ -1997,9 +2119,9 @@ function writeRunInfo(outdir, input, freshFiles){
 function processRun(){
   if(BUSY){ setStatus("A run is already in progress.","err"); return; }
   var mft=trimStr($("mftPath").value);
-  if(mft && !fileExists(mft)){ setStatus("The $MFT path is set but does not exist - clear it or fix it.","err"); return; }
+  if(mft && !inputSeen(mft,false,"$MFT")){ setStatus("The $MFT path is set but does not exist - clear it or fix it.","err"); return; }
   var j=trimStr($("jPath").value);
-  if(j && !fileExists(j)){ setStatus("The $J path is set but does not exist - clear it or fix it.","err"); return; }
+  if(j && !inputSeen(j,false,"$J")){ setStatus("The $J path is set but does not exist - clear it or fix it.","err"); return; }
   if(!mft && !j){ setStatus("Pick a $MFT and/or a $UsnJrnl:$J file first (at least one is required).","err"); return; }
   if(!EXE || !fileExists(EXE)){ setStatus("MFTECmd.exe not found - use 'Update / download MFTECmd'.","err"); return; }
 
@@ -2056,6 +2178,7 @@ function processRun(){
 
   // batEsc only the wrapping .bat line (the powershell command line itself is a bat line)
   var ctx=runBatAsync([ "powershell "+batEsc(psArgs)+" > \"__LOG__\" 2>&1" ], true);
+  ctx.procTimed=true; procStart("Processing");
   ctx.onTick=function(s){ setStatus("Working… "+s+"s (MFT parse is the slow part; large volumes take a few minutes)","muted"); };
   ctx.onTimeout=function(){ BUSY=false; $("runBtn").disabled=false; setStatus("Engine still running after 40 min - check the console window.","err"); };
   ctx.onDone=function(lg, mode){
@@ -2121,9 +2244,27 @@ function init(){
 
   var zoom=0.9;
   var zContent=$("content");
-  function applyZoom(){ zContent.style.zoom=zoom; zContent.style.width=(100/zoom)+"%"; var p=Math.round(zoom*100)+"%";
+  /* A+ / A- text scaling. <header> and the modal cards live OUTSIDE #content, so zooming #content
+     alone left the app's top row - and the Help dialog - at a fixed size while everything else grew
+     or shrank. Each block is zoomed and then widened by 1/zoom, because a zoom<1 shrinks a 100%-wide
+     block to less than the viewport and leaves a blank gutter down the right edge. For the modals the
+     CARD is scaled and not the fixed overlay, so the dim backdrop still covers the whole viewport at
+     any zoom level. (Ported from vSphere Support Bundle Analyzer.) */
+  function zoomBlock(el){ if(!el) return; el.style.zoom=zoom; el.style.width=(100/zoom)+"%"; el.style.boxSizing="border-box"; }
+  var ZOOM_MODALS=["helpModal"];
+  function applyZoom(){
+    zoomBlock(zContent);
+    var hs=document.getElementsByTagName("header"); if(hs.length) zoomBlock(hs[0]);
+    for(var mi=0;mi<ZOOM_MODALS.length;mi++){ var m=$(ZOOM_MODALS[mi]); if(!m) continue;
+      var cards=m.getElementsByTagName("div");
+      for(var ci=0;ci<cards.length;ci++){ if(/(^|\s)mcard(\s|$)/.test(cards[ci].className+"")){ cards[ci].style.zoom=zoom; break; } } }
+    var p=Math.round(zoom*100)+"%";
     $("fup").title="Larger text ("+p+")"; $("fdown").title="Smaller text ("+p+")"; }
   applyZoom();
+  /* re-assert the zoom-compensated widths on resize/maximise, so full-screening reflows to fill;
+     the header needs it too now that it is zoomed alongside #content. */
+  try{ window.onresize=function(){ try{ zContent.style.width=(100/zoom)+"%";
+    var hr=document.getElementsByTagName("header"); if(hr.length) hr[0].style.width=(100/zoom)+"%"; }catch(er){} }; }catch(eR){}
   $("fup").onclick=function(){ zoom=Math.min(zoom+0.15,2.5); applyZoom(); };
   $("fdown").onclick=function(){ zoom=Math.max(zoom-0.15,0.6); applyZoom(); };
 
@@ -2228,10 +2369,11 @@ function applyCli(cli){ if(!cli.input) return false;
   var fso=new ActiveXObject("Scripting.FileSystemObject");
   applyCaseWindow(cli.from, cli.to);   // case window (UTC): prefill Window from/to BEFORE any /auto build
   if(/\.html?$/i.test(cli.input) && fso.FileExists(cli.input)){ appendLog("CLI: opening report "+cli.input); LAST_REPORT=cli.input; window.setTimeout(function(){ openReport(cli.input); },60); return true; }
-  if(fso.FolderExists(cli.input)){ var hits=findMfts(cli.input);
+  var lng=isLongPath(cli.input) && !/\.html?$/i.test(cli.input), lk=lng?lpKind(cli.input):"";   // FSO cannot see a 260+ char path: ask its \\?\ form
+  if(fso.FolderExists(cli.input) || lk==="d"){ var hits=findMfts(cli.input);
     if(!hits.length){ setStatus("CLI: no $MFT found under "+cli.input,"err"); appendLog("CLI: no $MFT under "+cli.input); return false; }
     $("mftPath").value=hits[0]; var g=guessJ(hits[0]); if(g) $("jPath").value=g; hostGuessFrom(hits[0]); }
-  else if(fso.FileExists(cli.input)){
+  else if(fso.FileExists(cli.input) || lng){   // a long path not even the \\?\ form sees is taken as a file - processRun notes it, the engine reports a real miss
     if(isJName(cli.input)){ // $UsnJrnl:$J launched directly (e.g. by the Artifact-Finder) - route to $J, auto-pair $MFT
       $("jPath").value=cli.input; var mp=guessMft(cli.input);
       if(mp){ $("mftPath").value=mp; appendLog("CLI: $J input; auto-paired $MFT "+mp); } else { appendLog("CLI: $J input; no sibling $MFT found - journal-only run"); }

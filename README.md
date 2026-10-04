@@ -61,6 +61,8 @@ And a **Timeline ($J)** view of USN events — file-creation bursts, create-then
 - **"Story of an entry" detail pane** — click any row: all timestamps with the SI/FN timestomp delta highlighted, the Zone.Identifier download source, the score breakdown, and cross-links between an `$MFT` record and every `$J` event for the same entry — creation, writes, renames, deletion, in one place.
 - **Suspicion scoring** tuned on real incident data (table below). Suspicious rows are shaded; every tag carries its reasoning.
 - **Filters & reporting** — free-text search, tag chips with live counts, UTC date range, extension, path-scope, and per-user filters (the user is derived from `\Users\<name>\` in the path — click any row's User cell to isolate it; all filters persist across views); export the filtered view to CSV, or copy formatted lines into case notes.
+  - **Date range** takes `YYYY-MM-DD` (`/` or `.` separators and unpadded month/day are fine) with an optional `HH:MM[:SS]`; a bare end date runs to `23:59:59`. Anything it can't read unambiguously (e.g. day-first `16/09/2026`) is outlined red and ignored rather than silently applied, and the active window is shown above the grid with the column it filters (`Created 0x10` in Files, the USN timestamp in Timeline).
+  - **Extension** lists every extension present in the active view's rows, with counts, plus `(none)` for extensionless files.
 
 ## Quick start
 
