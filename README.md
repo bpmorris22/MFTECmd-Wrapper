@@ -110,7 +110,7 @@ The launcher can be started with arguments so an artifact-finder (or a shortcut)
 ```
 mshta.exe "MFTECmd-Wrapper.hta" "<inputOrReport>" ["<outDir>"] [/auto] [/from:yyyy-MM-dd] [/to:yyyy-MM-dd]
 ```
-- `<input>` — a `$MFT` file / collection directory (prefilled; the report is built if `/auto`), a `$UsnJrnl:$J` file (routed to the `$J` input, with the volume `$MFT` auto-paired when present — the DFIR-Windows-Artifact-Finder launches journals this way), or an existing `.html` report to re-open.
+- `<input>` — a `$MFT` file / collection directory (prefilled; the report is built if `/auto`), a `$UsnJrnl:$J` file (routed to the `$J` input, with the volume `$MFT` auto-paired when present — the DFIR-Windows-Artifact-Finder launches journals this way), or an existing `.html` report to re-open. A `$UsnJrnl:$Max` (the journal's 32-byte config stream, no events) is swapped for the `$J` beside it.
 - `<outDir>` — output directory for the report and CSVs (optional; defaults to `_Processed\<host>\MFTECmd` next to the app).
 - **Target hostname** is required before processing — it names the report file and the `_Processed\<host>\MFTECmd` output folder next to the app (family convention shared with the DFIR-Windows-Artifact-Finder). Guessed from `Collection-<host>-…` paths, a passed `_Processed\<host>\` outDir, or this machine's name for live paths — overwrite the guess if it's wrong.
 - **Shared IOC list** — if no IOC terms are given, an `IOC.txt` next to the app is passed to the engine automatically (one term per line, `#` comments); one list covers the whole toolkit.

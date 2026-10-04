@@ -1675,7 +1675,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.9.1";
+var APP_VERSION = "1.9.2";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -2019,7 +2019,13 @@ function guessJ(mft){
 /* v1.5.0: a collected USN journal is named "$UsnJrnl%3A$J" (Velociraptor keeps the literal %3A
    in the filename) or exactly "$J". Such a file routes to the $J input, never to $MFT. The %3A
    is part of the filename on disk - never unescape it. */
-function isJName(p){ var b=baseName(p).toLowerCase(); return b.indexOf("$usnjrnl")>=0 || b==="$j"; }
+function isJName(p){ var b=baseName(p).toLowerCase(); return (b.indexOf("$usnjrnl")>=0 || b==="$j") && !isMaxName(p); }
+/* v1.9.2: "$UsnJrnl%3A$Max" (or "$Max") is the journal's 32-byte config stream - max size, allocation
+   delta, journal ID - collected beside $J. It holds no events and MFTECmd rejects it ("Unknown file
+   type", exit 0, no csv), so it is never an input: maxToJ resolves the sibling $J in the same folder. */
+function isMaxName(p){ var b=baseName(p).toLowerCase(); return b==="$max" || (b.indexOf("$usnjrnl")>=0 && /\$max$/.test(b)); }
+function maxToJ(p){ if(!isMaxName(p)) return ""; var b=baseName(p), c=parentDir(p)+"\\"+b.substring(0,b.length-4)+"$J"; return fileSeen(c)?c:""; }
+var MAX_MSG="is $UsnJrnl:$Max - the USN journal's 32-byte config stream, not the journal. Use the $UsnJrnl:$J beside it.";
 /* v1.5.0: reverse of guessJ - given a $UsnJrnl:$J, find the volume $MFT by walking UP.
    Collected layout: ...\ntfs\<vol>\$Extend\$UsnJrnl%3A$J  with  ...\ntfs\<vol>\$MFT (two up).
    Flat exports may sit them side by side (one up). Auto-pairing upgrades a J-only run to a full
@@ -2119,6 +2125,10 @@ function writeRunInfo(outdir, input, freshFiles){
 function processRun(){
   if(BUSY){ setStatus("A run is already in progress.","err"); return; }
   var mft=trimStr($("mftPath").value);
+  if(isMaxName(mft)){ setStatus("The $MFT box "+MAX_MSG,"err"); return; }
+  var jm=trimStr($("jPath").value);   // a typed/pasted $Max in the $J box: swap in its sibling journal
+  if(isMaxName(jm)){ var mj=maxToJ(jm); if(!mj){ setStatus("The $J box "+MAX_MSG,"err"); return; }
+    $("jPath").value=mj; appendLog("$J box held $UsnJrnl:$Max (config stream, no events) - using the sibling $J "+mj); }
   if(mft && !inputSeen(mft,false,"$MFT")){ setStatus("The $MFT path is set but does not exist - clear it or fix it.","err"); return; }
   var j=trimStr($("jPath").value);
   if(j && !inputSeen(j,false,"$J")){ setStatus("The $J path is set but does not exist - clear it or fix it.","err"); return; }
@@ -2270,17 +2280,22 @@ function init(){
 
   // hidden native file pickers
   $("mftBrowse").onclick=function(){ $("mftPick").click(); };
-  $("mftPick").onchange=function(){ if(this.value){
+  $("mftPick").onchange=function(){ var v=this.value; if(v){
+    // a $UsnJrnl:$Max picked here stands for its sibling $J (no sibling: refuse it)
+    if(isMaxName(v)){ var mj=maxToJ(v); if(!mj){ setStatus("That file "+MAX_MSG,"err"); return; } v=mj; }
     // a $UsnJrnl:$J picked here belongs in the $J box - route it and auto-pair the $MFT
-    if(isJName(this.value)){ $("jPath").value=this.value; var mpp=guessMft(this.value); if(mpp) $("mftPath").value=mpp; hostGuessFrom(mpp||this.value);
+    if(isJName(v)){ $("jPath").value=v; var mpp=guessMft(v); if(mpp) $("mftPath").value=mpp; hostGuessFrom(mpp||v);
       setStatus(mpp?"That's a $UsnJrnl:$J - moved it to the $J box and auto-paired the volume $MFT.":"That's a $UsnJrnl:$J - moved it to the $J box (no sibling $MFT found; will run journal-only).","ok"); return; }
-    $("mftPath").value=this.value;
-    var g=guessJ(this.value); if(g && !trimStr($("jPath").value)){ $("jPath").value=g; setStatus("Found a sibling $J and filled it in.","ok"); }
-    hostGuessFrom(this.value); } };
+    $("mftPath").value=v;
+    var g=guessJ(v); if(g && !trimStr($("jPath").value)){ $("jPath").value=g; setStatus("Found a sibling $J and filled it in.","ok"); }
+    hostGuessFrom(v); } };
   $("jBrowse").onclick=function(){ $("jPick").click(); };
-  $("jPick").onchange=function(){ if(this.value){ $("jPath").value=this.value;
+  $("jPick").onchange=function(){ var v=this.value; if(v){
+    if(isMaxName(v)){ var mj=maxToJ(v); if(!mj){ setStatus("That file "+MAX_MSG,"err"); return; }
+      v=mj; setStatus("Picked $UsnJrnl:$Max (config stream, no events) - using the sibling $J instead.","ok"); }
+    $("jPath").value=v;
     // supplied a journal with no $MFT yet - try to auto-pair the volume $MFT (reverse of guessJ)
-    if(!trimStr($("mftPath").value)){ var mpj=guessMft(this.value); if(mpj){ $("mftPath").value=mpj; hostGuessFrom(mpj); setStatus("Auto-paired the volume $MFT for this journal.","ok"); } } } };
+    if(!trimStr($("mftPath").value)){ var mpj=guessMft(v); if(mpj){ $("mftPath").value=mpj; hostGuessFrom(mpj); setStatus("Auto-paired the volume $MFT for this journal.","ok"); } } } };
   $("jClear").onclick=function(){ $("jPath").value=""; };
 
   $("mftDirBrowse").onclick=function(){
@@ -2374,6 +2389,10 @@ function applyCli(cli){ if(!cli.input) return false;
     if(!hits.length){ setStatus("CLI: no $MFT found under "+cli.input,"err"); appendLog("CLI: no $MFT under "+cli.input); return false; }
     $("mftPath").value=hits[0]; var g=guessJ(hits[0]); if(g) $("jPath").value=g; hostGuessFrom(hits[0]); }
   else if(fso.FileExists(cli.input) || lng){   // a long path not even the \\?\ form sees is taken as a file - processRun notes it, the engine reports a real miss
+    if(isMaxName(cli.input)){ // $UsnJrnl:$Max (Finder <= 0.18.0 made a row of it) - run the sibling $J instead
+      var mj=maxToJ(cli.input);
+      if(!mj){ setStatus("CLI: "+baseName(cli.input)+" "+MAX_MSG,"err"); appendLog("CLI: $Max input with no sibling $J: "+cli.input); return false; }
+      appendLog("CLI: "+baseName(cli.input)+" is the journal's config stream (no events) - using the sibling $J "+mj); cli.input=mj; }
     if(isJName(cli.input)){ // $UsnJrnl:$J launched directly (e.g. by the Artifact-Finder) - route to $J, auto-pair $MFT
       $("jPath").value=cli.input; var mp=guessMft(cli.input);
       if(mp){ $("mftPath").value=mp; appendLog("CLI: $J input; auto-paired $MFT "+mp); } else { appendLog("CLI: $J input; no sibling $MFT found - journal-only run"); }
@@ -2500,7 +2519,7 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
     <p><code>mshta "MFTECmd-Wrapper.hta" "&lt;inputOrReport&gt;" ["&lt;outDir&gt;"] [/auto] [/from:yyyy-MM-dd] [/to:yyyy-MM-dd]</code></p>
     <ul>
       <li><code>&lt;input&gt;</code> — a <code>$MFT</code> file / collection directory (prefilled; report built with <code>/auto</code>), or an existing <code>.html</code> report to re-open.</li>
-      <li>…or a <code>$UsnJrnl:$J</code> alone — the wrapper auto-pairs the volume's <code>$MFT</code> when it sits in the usual collected layout; without one the journal is parsed standalone (no ParentPath). At least one of <code>$MFT</code> / <code>$J</code> is required.</li>
+      <li>…or a <code>$UsnJrnl:$J</code> alone — the wrapper auto-pairs the volume's <code>$MFT</code> when it sits in the usual collected layout; without one the journal is parsed standalone (no ParentPath). At least one of <code>$MFT</code> / <code>$J</code> is required. A <code>$UsnJrnl:$Max</code> (the journal's 32-byte config stream, no events) is swapped for the <code>$J</code> beside it.</li>
       <li><code>&lt;outDir&gt;</code> — output directory for the report &amp; CSVs (optional). &nbsp; <code>/auto</code> — build immediately.</li>
       <li><code>/from:yyyy-MM-dd</code> <code>/to:yyyy-MM-dd</code> — case window (UTC, inclusive): prefills the Window from/to fields and is recorded in runinfo; never affects scoring.</li>
       <li><b>Target hostname</b> is required before processing — it names the output folder <code>_Processed\&lt;host&gt;\MFTECmd</code> next to this app and the <code>&lt;host&gt;-MFT-Report.html</code> filename (family convention shared with the Artifact-Finder). Guessed from <code>Collection-&lt;host&gt;-…</code> paths, a passed <code>_Processed\&lt;host&gt;\</code> outDir, or this machine's name for live paths — overwrite the guess if it's wrong.</li>
