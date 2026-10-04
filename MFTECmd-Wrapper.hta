@@ -390,12 +390,11 @@ Say ("Engine v" + $AppVersion + "  host=" + $HostLabel + "  iocs=" + $nIoc + "  
 if ($MftecmdPath -eq "") {
     $cand = @(
         (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "MFTECmd.exe"),
-        "C:\Users\Forensics\Downloads\1-Package\KAPE\Modules\bin\MFTECmd.exe",
         "C:\Tools\net9\MFTECmd.exe"
     )
     foreach ($c in $cand) { if (Test-Path -LiteralPath $c) { $MftecmdPath = $c; break } }
 }
-if ($MftecmdPath -eq "" -or -not (Test-Path -LiteralPath $MftecmdPath)) { Fail "MFTECmd.exe not found (searched script dir, KAPE bin, C:\Tools\net9)" }
+if ($MftecmdPath -eq "" -or -not (Test-Path -LiteralPath $MftecmdPath)) { Fail "MFTECmd.exe not found (searched script dir, C:\Tools\net9)" }
 $toolVer = (Get-Item -LiteralPath $MftecmdPath).VersionInfo.FileVersion
 
 $mftCsv = Join-Path $csvDir "mft.csv"
@@ -1675,7 +1674,7 @@ exit 0
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "1.9.2";
+var APP_VERSION = "1.9.3";
 var KNOWN_LATEST_MFTECMD = "2026.5.0";                                            // baseline as of 2026-07-03 (current EZ .NET9 CalVer build; KAPE bundled an older 1.2.2.1)
 var MFTECMD_ZIP_URL = "https://download.ericzimmermanstools.com/net9/MFTECmd.zip";  // official EZ mirror (.NET 9 build)
 var MFTECMD_PAGE = "https://ericzimmerman.github.io/";                            // live latest-version lookup
@@ -1899,7 +1898,6 @@ function resolveExe(){
   var fso=new ActiveXObject("Scripting.FileSystemObject");
   var dir=htaFolder(), cands=[];
   if(dir) cands.push(dir+"\\MFTECmd.exe");
-  cands.push("C:\\Users\\Forensics\\Downloads\\1-Package\\KAPE\\Modules\\bin\\MFTECmd.exe");   // known install on this box
   cands.push("C:\\ZimmermanTools\\net9\\MFTECmd.exe");
   cands.push("C:\\ZimmermanTools\\MFTECmd.exe");
   cands.push("C:\\Tools\\net9\\MFTECmd.exe");
